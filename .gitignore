@@ -1,0 +1,19 @@
+# Customer data — never upload (real khata records, photos, backups)
+data/
+data_test/
+
+# Python
+__pycache__/
+*.pyc
+
+# Test artifacts / scratch
+test_out.*
+gui-test-screenshots/
+pdf_page1.jpg
+
+# Machine-specific deploy config
+web/.vercel/
+
+# OS
+Thumbs.db
+Desktop.ini
