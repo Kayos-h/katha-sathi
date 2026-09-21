@@ -122,9 +122,9 @@ TABLES = [
 
 
 def get_database_url():
-    url = os.environ.get("DATABASE_URL", "").strip()
+    url = os.environ.get("DATABASE_URL", "").strip().lstrip("\ufeff")
     if not url:
-        url = os.environ.get("POSTGRES_URL", "").strip() or os.environ.get("POSTGRES_PRISMA_URL", "").strip()
+        url = os.environ.get("POSTGRES_URL", "").strip().lstrip("\ufeff") or os.environ.get("POSTGRES_PRISMA_URL", "").strip().lstrip("\ufeff")
     if url.startswith("postgres://"):
         url = "postgresql://" + url[11:]
     return url

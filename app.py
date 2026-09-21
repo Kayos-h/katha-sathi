@@ -30,9 +30,9 @@ WEB_DIR = os.path.join(APP_DIR, "web")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "khatasathi-cloud-secret-key-2083")
 SESSION_TTL = 60 * 60 * 24 * 7  # 7 days
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "").strip() or os.environ.get("SUPABASE_KEY", "").strip()
-SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "").strip()
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().lstrip("\ufeff").rstrip("/")
+SUPABASE_ANON_KEY = (os.environ.get("SUPABASE_ANON_KEY", "").strip().lstrip("\ufeff") or os.environ.get("SUPABASE_KEY", "").strip().lstrip("\ufeff"))
+SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "").strip().lstrip("\ufeff")
 
 MONEY_NOTE = "Amounts are stored as plain numbers; the UI converts Devanagari digits."
 
