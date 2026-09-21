@@ -25,7 +25,7 @@ const Galla = {
       '<div class="view-actions" id="gl-actions"></div></div>' +
       '<div class="galla-tabs" style="display:flex;gap:8px;margin-bottom:16px">' +
       '<button class="btn ' + (this.tab === "today" ? "primary" : "ghost") + '" data-tab="today">' + ico("wallet") + "Today's Drawer</button>" +
-      '<button class="btn ' + (this.tab === "history" ? "primary" : "ghost") + '" data-tab="history">' + ico("clock") + "30-Day History</button>' +
+      '<button class="btn ' + (this.tab === "history" ? "primary" : "ghost") + '" data-tab="history">' + ico("clock") + "30-Day History</button>" +
       '</div>' +
       '<div id="gl-body"></div>';
 
@@ -111,7 +111,7 @@ const Galla = {
       '<input class="input big money" id="go-amt" placeholder="Rs. 0" inputmode="text"></div>' +
       '<div class="field" style="max-width:340px;margin-top:12px">' +
       '<label>Note (optional)</label><input class="input" id="go-note" placeholder="e.g. morning cash float"></div>' +
-      '<button class="btn primary lg" id="go-open" style="margin-top:16px">' + ico("check") + "Open today's galla</button>' +
+      '<button class="btn primary lg" id="go-open" style="margin-top:16px">' + ico("check") + "Open today's galla</button>" +
       "</div>";
     const amt = body.querySelector("#go-amt");
     amt.addEventListener("input", () => {
