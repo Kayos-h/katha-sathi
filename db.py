@@ -84,7 +84,8 @@ CREATE TABLE IF NOT EXISTS galla_entries (
     amount REAL NOT NULL,
     note TEXT DEFAULT '',
     created_at TEXT NOT NULL,
-    bill_id TEXT DEFAULT ''      -- set when a counter-paid bill put this cash in
+    bill_id TEXT DEFAULT '',     -- set when bill activity put this cash in
+    payment_id TEXT DEFAULT ''   -- set when a ledger/payment action put this cash in
 );
 """
 
@@ -110,6 +111,8 @@ def init():
     cols = [r[1] for r in conn.execute("PRAGMA table_info(galla_entries)")]
     if "bill_id" not in cols:
         conn.execute("ALTER TABLE galla_entries ADD COLUMN bill_id TEXT DEFAULT ''")
+    if "payment_id" not in cols:
+        conn.execute("ALTER TABLE galla_entries ADD COLUMN payment_id TEXT DEFAULT ''")
     conn.commit()
     conn.close()
 
@@ -340,20 +343,56 @@ def merge_people(primary_id, dup_id):
 
 # ---------------- bills ----------------
 
+def _insert_payment_for_bill(conn, person_id, bill_id, amount, note, photo, when):
+    pmt_id = new_id()
+    conn.execute(
+        "INSERT INTO payments (id, person_id, amount, note, photo, created_at)"
+        " VALUES (?,?,?,?,?,?)",
+        (pmt_id, person_id, f2(amount), note or "", photo or "", when),
+    )
+    conn.execute(
+        "INSERT INTO payment_allocations (id, payment_id, bill_id, amount)"
+        " VALUES (?,?,?,?)",
+        (new_id(), pmt_id, bill_id, f2(amount)),
+    )
+    audit(conn, "payment_create", pmt_id, {
+        "person_id": person_id, "amount": f2(amount), "note": note or "",
+        "photo": bool(photo), "bill_id": bill_id,
+        "cleared": [{"bill_id": bill_id, "amount": f2(amount)}],
+    })
+    return pmt_id
+
+
 def create_bill(person_id, amount, photo="", note="", already_paid=False,
-                created_at=None):
+                created_at=None, paid_amount=0, paid_note="", require_galla=True):
     amount = f2(amount)
     if amount <= 0:
         raise ValueError("Amount must be greater than zero")
+    paid_amount = f2(paid_amount)
+    if paid_amount < 0:
+        raise ValueError("Paid amount can't be negative")
+    if already_paid and paid_amount > 0:
+        raise ValueError("Use either already paid or paid now, not both")
+    if paid_amount > amount + 0.005:
+        raise ValueError("Paid amount can't be more than the bill total")
+    when = created_at or now_iso()
     conn = connect()
     person = conn.execute("SELECT id, name FROM people WHERE id=?", (person_id,)).fetchone()
     if person is None:
         conn.close()
         raise ValueError("Person not found")
+    if require_galla and when[:10] == _today():
+        try:
+            _require_galla_open(conn, when[:10])
+        except Exception:
+            conn.close()
+            raise
     bid = new_id()
-    when = created_at or now_iso()
     if already_paid:
         remaining, status = 0.0, "paid"
+    elif paid_amount > 0:
+        remaining = f2(amount - paid_amount)
+        status = "paid" if remaining < 0.005 else "open"
     else:
         remaining, status = amount, "open"
     conn.execute(
@@ -364,18 +403,37 @@ def create_bill(person_id, amount, photo="", note="", already_paid=False,
     )
     audit(conn, "bill_create", bid, {
         "person_id": person_id, "amount": amount, "already_paid": bool(already_paid),
-        "photo": bool(photo), "note": note or "",
+        "paid_amount": paid_amount, "photo": bool(photo), "note": note or "",
     })
+    pmt_id = ""
+    galla_entry_id = ""
+    if paid_amount > 0:
+        pmt_id = _insert_payment_for_bill(
+            conn, person_id, bid, paid_amount,
+            paid_note or "paid while making bill", "", when,
+        )
+        galla_entry_id = _galla_in_for_transaction(
+            conn, paid_amount, when,
+            "bill payment - " + person["name"],
+            bill_id=bid, payment_id=pmt_id, require_open=require_galla,
+        )
+    elif already_paid:
+        galla_entry_id = _galla_in_for_transaction(
+            conn, amount, when,
+            "counter sale - " + person["name"],
+            bill_id=bid, require_open=require_galla,
+        )
     conn.commit()
     conn.close()
     broadcast("ledger", {"person_id": person_id})
     broadcast("dash", {})
     broadcast("people", {})
-    galla_in = False
-    if already_paid:
-        galla_in = _galla_counter_in(bid, amount, when,
-                                     "counter sale — " + person["name"]) is not None
-    return {"id": bid, "created_at": when, "galla_in": galla_in}
+    if galla_entry_id:
+        broadcast("galla", {"date": when[:10]})
+    galla_in = bool(galla_entry_id)
+    return {"id": bid, "created_at": when, "galla_in": galla_in,
+            "paid_amount": paid_amount, "payment_id": pmt_id,
+            "remaining": remaining, "galla_entry_id": galla_entry_id}
 
 
 def get_bill(bid):
@@ -406,7 +464,7 @@ def update_bill(bid, amount=None, note=None):
         if amount < paid_so_far - 0.005:
             conn.close()
             raise ValueError(
-                "This bill already has रू %s paid against it, so the amount "
+                "This bill already has Rs. %s paid against it, so the amount "
                 "can't be lower than that." % f"{paid_so_far:,.2f}"
             )
         remaining = f2(amount - paid_so_far)
@@ -480,12 +538,29 @@ def set_bill_void(bid, void=True):
         if bill["already_paid"]:
             # already-paid-at-counter bill: no money was ever owed
             remaining, status = 0.0, "paid"
+            galla_entry_id = ""
+            if bill["created_at"][:10] == _today():
+                try:
+                    _require_galla_open(conn, _today())
+                except Exception:
+                    conn.close()
+                    raise
         else:
             remaining, status = f2(bill["amount"]), "open"
         conn.execute(
             "UPDATE bills SET status=?, remaining=? WHERE id=?",
             (status, remaining, bid),
         )
+        if bill["already_paid"] and bill["created_at"][:10] == _today():
+            person = conn.execute(
+                "SELECT name FROM people WHERE id=?", (bill["person_id"],)
+            ).fetchone()
+            galla_entry_id = _galla_in_for_transaction(
+                conn, bill["amount"], now_iso(),
+                "counter sale restored - " + (person["name"] if person else "bill"),
+                bill_id=bid, require_open=True,
+            )
+            galla_touched = bool(galla_entry_id)
         audit(conn, "bill_unvoid", bid, {
             "person_id": bill["person_id"], "amount": f2(bill["amount"]),
         })
@@ -525,7 +600,8 @@ def next_bill_no(conn=None):
 
 
 def create_itemized_bill(person_id, items, photo="", note="", already_paid=False,
-                         created_at=None):
+                         created_at=None, paid_amount=0, paid_note="",
+                         require_galla=True):
     """Estimate-form bill: line items with qty x rate, one master amount.
 
     The master amount (sum of items) is what the khata math uses, so
@@ -546,18 +622,37 @@ def create_itemized_bill(person_id, items, photo="", note="", already_paid=False
     if not clean:
         raise ValueError("Add at least one item with particulars and an amount")
     total = f2(sum(c["amount"] for c in clean))
+    paid_amount = f2(paid_amount)
+    if paid_amount < 0:
+        raise ValueError("Paid amount can't be negative")
+    if already_paid and paid_amount > 0:
+        raise ValueError("Use either already paid or paid now, not both")
+    if paid_amount > total + 0.005:
+        raise ValueError("Paid amount can't be more than the bill total")
     for c in clean:
         if c["qty"] <= 0:
             c["qty"] = 1
+    when = created_at or now_iso()
     conn = connect()
     person = conn.execute("SELECT id, name FROM people WHERE id=?", (person_id,)).fetchone()
     if person is None:
         conn.close()
         raise ValueError("Person not found")
+    if require_galla and when[:10] == _today():
+        try:
+            _require_galla_open(conn, when[:10])
+        except Exception:
+            conn.close()
+            raise
     bid = new_id()
-    when = created_at or now_iso()
     bill_no = next_bill_no(conn)
-    remaining, status = (0.0, "paid") if already_paid else (total, "open")
+    if already_paid:
+        remaining, status = 0.0, "paid"
+    elif paid_amount > 0:
+        remaining = f2(total - paid_amount)
+        status = "paid" if remaining < 0.005 else "open"
+    else:
+        remaining, status = total, "open"
     conn.execute(
         "INSERT INTO bills (id, person_id, amount, remaining, status, already_paid,"
         " photo, note, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -572,22 +667,42 @@ def create_itemized_bill(person_id, items, photo="", note="", already_paid=False
     )
     audit(conn, "bill_create", bid, {
         "person_id": person_id, "amount": total, "already_paid": bool(already_paid),
+        "paid_amount": paid_amount,
         "bill_no": bill_no, "items": [{"particulars": c["particulars"],
                                        "qty": c["qty"], "rate": c["rate"],
                                        "amount": c["amount"]} for c in clean],
         "photo": bool(photo), "note": note or "",
     })
+    pmt_id = ""
+    galla_entry_id = ""
+    if paid_amount > 0:
+        pmt_id = _insert_payment_for_bill(
+            conn, person_id, bid, paid_amount,
+            paid_note or "paid while making bill", "", when,
+        )
+        galla_entry_id = _galla_in_for_transaction(
+            conn, paid_amount, when,
+            "bill payment - " + person["name"],
+            bill_id=bid, payment_id=pmt_id, require_open=require_galla,
+        )
+    elif already_paid:
+        galla_entry_id = _galla_in_for_transaction(
+            conn, total, when,
+            "counter sale - " + person["name"],
+            bill_id=bid, require_open=require_galla,
+        )
     conn.commit()
     conn.close()
     broadcast("ledger", {"person_id": person_id})
     broadcast("dash", {})
     broadcast("people", {})
-    galla_in = False
-    if already_paid:
-        galla_in = _galla_counter_in(bid, total, when,
-                                     "counter sale — " + person["name"]) is not None
+    if galla_entry_id:
+        broadcast("galla", {"date": when[:10]})
+    galla_in = bool(galla_entry_id)
     return {"id": bid, "bill_no": bill_no, "amount": total, "created_at": when,
-            "galla_in": galla_in}
+            "galla_in": galla_in, "paid_amount": paid_amount,
+            "payment_id": pmt_id, "remaining": remaining,
+            "galla_entry_id": galla_entry_id}
 
 
 def bill_items(bid):
@@ -656,7 +771,7 @@ def _bill_pay_plan(conn, person_id, bill_id, amount):
         raise ValueError("That bill is already fully paid")
     if amount > b["remaining"] + 0.005:
         raise ValueError(
-            "That's more than this bill's remaining रू %s — pay the rest of "
+            "That's more than this bill's remaining Rs. %s — pay the rest of "
             "the balance from the person's account, not this bill."
             % f"{f2(b['remaining']):,.2f}")
     return [{
@@ -686,21 +801,29 @@ def payment_preview(person_id, amount, bill_id=None):
         raise ValueError("This person has no open bills to pay against")
     if amount > open_total + 0.005:
         raise ValueError(
-            "That's more than the open balance of रू %s, and Khata Sathi can't "
+            "That's more than the open balance of Rs. %s, and Khata Sathi can't "
             "hold extra money." % f"{open_total:,.2f}"
         )
     return {"ok": True, "plan": _fifo_plan(bills, amount), "open_total": open_total}
 
 
-def record_payment(person_id, amount, note="", photo="", created_at=None, bill_id=None):
+def record_payment(person_id, amount, note="", photo="", created_at=None, bill_id=None,
+                   require_galla=True):
     amount = f2(amount)
     if amount <= 0:
         raise ValueError("Amount must be greater than zero")
+    when = created_at or now_iso()
     conn = connect()
     person = conn.execute("SELECT * FROM people WHERE id=?", (person_id,)).fetchone()
     if person is None:
         conn.close()
         raise ValueError("Person not found")
+    if require_galla and when[:10] == _today():
+        try:
+            _require_galla_open(conn, when[:10])
+        except Exception:
+            conn.close()
+            raise
     if bill_id:
         plan = _bill_pay_plan(conn, person_id, bill_id, amount)
     else:
@@ -712,12 +835,11 @@ def record_payment(person_id, amount, note="", photo="", created_at=None, bill_i
         if amount > open_total + 0.005:
             conn.close()
             raise ValueError(
-                "That's more than %s's open balance of रू %s, and Khata Sathi "
+                "That's more than %s's open balance of Rs. %s, and Khata Sathi "
                 "can't hold extra money." % (person["name"], f"{open_total:,.2f}")
             )
         plan = _fifo_plan(bills, amount)
     pmt_id = new_id()
-    when = created_at or now_iso()
     conn.execute(
         "INSERT INTO payments (id, person_id, amount, note, photo, created_at)"
         " VALUES (?,?,?,?,?,?)",
@@ -740,12 +862,20 @@ def record_payment(person_id, amount, note="", photo="", created_at=None, bill_i
         "photo": bool(photo), "bill_id": bill_id or "",
         "cleared": [{"bill_id": a["bill_id"], "amount": a["apply"]} for a in plan],
     })
+    galla_entry_id = _galla_in_for_transaction(
+        conn, amount, when,
+        "payment - " + person["name"] + ((" - " + note) if note else ""),
+        payment_id=pmt_id, require_open=require_galla,
+    )
     conn.commit()
     conn.close()
     broadcast("ledger", {"person_id": person_id})
     broadcast("dash", {})
     broadcast("people", {})
-    return {"id": pmt_id, "created_at": when, "plan": plan}
+    if galla_entry_id:
+        broadcast("galla", {"date": when[:10]})
+    return {"id": pmt_id, "created_at": when, "plan": plan,
+            "galla_in": bool(galla_entry_id), "galla_entry_id": galla_entry_id}
 
 
 def payment_detail(pmt_id):
@@ -804,6 +934,19 @@ def undo_payment(pmt_id, reason=""):
     if pmt is None:
         conn.close()
         raise ValueError("Payment not found")
+    galla_entries = conn.execute(
+        "SELECT * FROM galla_entries WHERE payment_id=?", (pmt_id,)
+    ).fetchall()
+    for e in galla_entries:
+        day = conn.execute(
+            "SELECT closing FROM galla_days WHERE date=?", (e["date"],)
+        ).fetchone()
+        if day is not None and day["closing"] is not None:
+            conn.close()
+            raise ValueError(
+                "This payment is already included in a closed galla day. "
+                "Closed drawer history is locked."
+            )
     allocs = conn.execute(
         "SELECT * FROM payment_allocations WHERE payment_id=?", (pmt_id,)
     ).fetchall()
@@ -812,6 +955,13 @@ def undo_payment(pmt_id, reason=""):
             "UPDATE bills SET remaining=remaining+?, status='open' WHERE id=?",
             (a["amount"], a["bill_id"]),
         )
+    for e in galla_entries:
+        conn.execute("DELETE FROM galla_entries WHERE id=?", (e["id"],))
+        audit(conn, "galla_entry_undo", e["id"], {
+            "date": e["date"], "direction": e["direction"],
+            "amount": f2(e["amount"]), "note": e["note"] or "",
+            "payment_id": pmt_id, "reason": "payment undone",
+        })
     conn.execute("DELETE FROM payment_allocations WHERE payment_id=?", (pmt_id,))
     conn.execute("DELETE FROM payments WHERE id=?", (pmt_id,))
     audit(conn, "payment_undo", pmt_id, {
@@ -824,6 +974,8 @@ def undo_payment(pmt_id, reason=""):
     broadcast("ledger", {"person_id": pmt["person_id"]})
     broadcast("dash", {})
     broadcast("people", {})
+    if galla_entries:
+        broadcast("galla", {})
     return True
 
 
@@ -1064,27 +1216,81 @@ def _today():
     return datetime.now().strftime("%Y-%m-%d")
 
 
+def _require_galla_open(conn, d):
+    row = conn.execute("SELECT closing FROM galla_days WHERE date=?", (d,)).fetchone()
+    if row is None:
+        raise ValueError("Open today's galla first (enter the morning cash)")
+    if row["closing"] is not None:
+        raise ValueError("Today's galla is already closed for the day")
+    return row
+
+
+def require_galla_open(date=None):
+    """Public guard for API routes that should not partially create records."""
+    d = str(date) if date else _today()
+    conn = connect()
+    try:
+        _require_galla_open(conn, d)
+    finally:
+        conn.close()
+    return True
+
+
+def _insert_galla_entry(conn, d, direction, amount, note="", created_at=None,
+                        bill_id="", payment_id=""):
+    eid = new_id()
+    conn.execute(
+        "INSERT INTO galla_entries"
+        " (id, date, direction, amount, note, created_at, bill_id, payment_id)"
+        " VALUES (?,?,?,?,?,?,?,?)",
+        (eid, d, direction, f2(amount), note or "", created_at or now_iso(),
+         bill_id or "", payment_id or ""),
+    )
+    audit(conn, "galla_entry", eid, {"date": d, "direction": direction,
+                                     "amount": f2(amount), "note": note or "",
+                                     "bill_id": bill_id or "",
+                                     "payment_id": payment_id or ""})
+    return eid
+
+
+def _galla_in_for_transaction(conn, amount, when, note, bill_id="",
+                              payment_id="", require_open=True):
+    """Put current-day cash into galla from a bill/payment transaction.
+
+    Backdated demo/import rows do not rewrite today's drawer. Live rows require
+    today's drawer to be open so the khata and galla cannot drift apart.
+    """
+    d = (when or now_iso())[:10]
+    if d != _today():
+        return ""
+    if require_open:
+        _require_galla_open(conn, d)
+    else:
+        row = conn.execute("SELECT closing FROM galla_days WHERE date=?", (d,)).fetchone()
+        if row is None or row["closing"] is not None:
+            return ""
+    return _insert_galla_entry(
+        conn, d, "in", amount, note, created_at=when,
+        bill_id=bill_id, payment_id=payment_id,
+    )
+
+
 def _galla_counter_in(bill_id, amount, when, note):
     """A bill paid at the counter means that cash is physically in the drawer.
 
-    Called after a bill is saved. Adds an 'in' entry to today's galla —
-    but only if today's galla is already open and not closed yet. If the
-    drawer hasn't been opened today, the cash is simply not tracked there
-    (the bill is still saved); opening the galla later with the right
-    morning amount covers it. Returns the entry id, or None.
+    Compatibility wrapper for older call sites: add an 'in' entry only when
+    today's drawer is already open. New bill/payment code uses the stricter
+    transaction helper above so live money cannot bypass galla.
     """
     try:
-        d = _today()
-        if when[:10] != d:            # backdated bill: belongs to another day's drawer
-            return None
         conn = connect()
-        row = conn.execute(
-            "SELECT closing FROM galla_days WHERE date=?", (d,)).fetchone()
+        eid = _galla_in_for_transaction(
+            conn, amount, when, note, bill_id=bill_id, require_open=False)
+        conn.commit()
         conn.close()
-        if row is None or row["closing"] is not None:
-            return None               # not open, or already counted — don't touch
-        out = galla_add_entry("in", amount, note=note, bill_id=bill_id)
-        return out.get("id") if out else None
+        if eid:
+            broadcast("galla", {"date": when[:10]})
+        return eid or None
     except Exception:
         return None                  # galla is a helper, never blocks a bill save
 
@@ -1099,7 +1305,7 @@ def galla_open(opening, date=None, note=""):
     row = conn.execute("SELECT * FROM galla_days WHERE date=?", (d,)).fetchone()
     if row is not None:
         conn.close()
-        raise ValueError("This day's galla is already open with रू %s" %
+        raise ValueError("This day's galla is already open with Rs. %s" %
                          f"{f2(row['opening']):,.2f}")
     conn.execute(
         "INSERT INTO galla_days (date, opening, closing, note) VALUES (?,?,?,?)",
@@ -1112,7 +1318,7 @@ def galla_open(opening, date=None, note=""):
     return {"date": d, "opening": opening}
 
 
-def galla_add_entry(direction, amount, note="", date=None, bill_id=""):
+def galla_add_entry(direction, amount, note="", date=None, bill_id="", payment_id=""):
     """Money put in ('in') or taken out ('out') of the drawer during the day."""
     if direction not in ("in", "out"):
         raise ValueError("Direction must be 'in' or 'out'")
@@ -1121,22 +1327,15 @@ def galla_add_entry(direction, amount, note="", date=None, bill_id=""):
         raise ValueError("Amount must be greater than zero")
     d = str(date) if date else _today()
     conn = connect()
-    row = conn.execute("SELECT * FROM galla_days WHERE date=?", (d,)).fetchone()
-    if row is None:
+    try:
+        _require_galla_open(conn, d)
+    except Exception:
         conn.close()
-        raise ValueError("Open today's galla first (enter the morning cash)")
-    if row["closing"] is not None:
-        conn.close()
-        raise ValueError("Today's galla is already closed for the day")
-    eid = new_id()
-    conn.execute(
-        "INSERT INTO galla_entries (id, date, direction, amount, note, created_at, bill_id)"
-        " VALUES (?,?,?,?,?,?,?)",
-        (eid, d, direction, amount, note or "", now_iso(), bill_id or ""),
+        raise
+    eid = _insert_galla_entry(
+        conn, d, direction, amount, note, bill_id=bill_id,
+        payment_id=payment_id,
     )
-    audit(conn, "galla_entry", eid, {"date": d, "direction": direction,
-                                     "amount": amount, "note": note or "",
-                                     "bill_id": bill_id or ""})
     conn.commit()
     conn.close()
     broadcast("galla", {"date": d})
@@ -1177,7 +1376,7 @@ def galla_summary(date=None):
         conn.close()
         return {"date": d, "open": False}
     entries = conn.execute(
-        "SELECT id, direction, amount, note, created_at, bill_id FROM galla_entries"
+        "SELECT id, direction, amount, note, created_at, bill_id, payment_id FROM galla_entries"
         " WHERE date=? ORDER BY created_at, rowid",
         (d,),
     ).fetchall()
@@ -1192,7 +1391,8 @@ def galla_summary(date=None):
         "date": d, "open": True, "opening": opening,
         "entries": [{"id": e["id"], "direction": e["direction"],
                      "amount": f2(e["amount"]), "note": e["note"] or "",
-                     "at": e["created_at"], "bill_id": e["bill_id"] or ""}
+                     "at": e["created_at"], "bill_id": e["bill_id"] or "",
+                     "payment_id": e["payment_id"] or ""}
                     for e in entries],
         "cash_in": cash_in, "cash_out": cash_out, "expected": expected,
         "closing": closing, "difference": diff,
@@ -1227,6 +1427,11 @@ def galla_undo_entry(eid):
     if e is None:
         conn.close()
         raise ValueError("Entry not found")
+    if e["payment_id"]:
+        conn.close()
+        raise ValueError(
+            "This entry came from a payment — undo that payment from the "
+            "ledger and the cash comes out of galla with it.")
     if e["bill_id"]:
         conn.close()
         raise ValueError(

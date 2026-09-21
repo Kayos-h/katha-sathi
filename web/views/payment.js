@@ -10,17 +10,22 @@ const Payment = {
   person: null,
   plan: null,
   billId: null,        // set = pay ONE bill (the partial-payment path)
+  prefillFull: false,
   photoFile: null, photoBytes: null, photoUrl: "",
 
   async render(main, params) {
     this.photoFile = null; this.photoBytes = null; this.photoUrl = "";
     this.billId = (params && params.bill) || null;
+    this.bill = null;
+    this.prefillFull = !!(params && params.full);
     main.innerHTML =
       '<div class="view-head">' +
       '<div><div class="view-title">Got money</div>' +
       '<div class="view-sub">' + (this.billId
         ? "Paying one bill — partial payments are fine; the bill turns part-paid, then paid."
-        : "Record a payment — it clears the oldest bills first.") + "</div></div></div>" +
+        : (this.prefillFull
+          ? "Full clear is ready — save to clear the whole open balance."
+          : "Record a payment — type any amount, or clear the full balance.")) + "</div></div></div>" +
       '<div class="add-grid">' +
       '<div class="panel panel-pad" id="pay-left"></div>' +
       '<div class="panel panel-pad" id="pay-right"></div>' +
@@ -63,7 +68,9 @@ const Payment = {
         : "Open bills (oldest first)") + "</div>" +
       '<div class="ob-list" id="pay-bills"></div>';
     API.get("/api/openbills?id=" + encodeURIComponent(p.id)).then((d) => {
-      main.querySelector("#pay-bills").innerHTML = d.bills.length
+      const list = main.querySelector("#pay-bills");
+      if (!list) return;
+      list.innerHTML = d.bills.length
         ? d.bills.map((b) => {
           const mine = this.billId && b.id === this.billId;
           return '<div class="ob-item"' + (mine ? ' style="border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)"' : "") + '>' +
@@ -74,7 +81,10 @@ const Payment = {
           "</div>";
         }).join("")
         : emptyRow3("No open bills");
-    }).catch(() => { main.querySelector("#pay-bills").innerHTML = emptyRow3("Could not load bills"); });
+    }).catch(() => {
+      const list = main.querySelector("#pay-bills");
+      if (list) list.innerHTML = emptyRow3("Could not load bills");
+    });
   },
 
   renderRight(main) {
@@ -86,7 +96,7 @@ const Payment = {
       '<div><div style="font-weight:750;font-size:15.5px">' + escapeHtml(p.name) + "</div>" +
       '<div class="hint">owes <b class="money neg">' + fmtMoney(p.balance) + "</b></div></div></div>" +
       '<div class="field" style="margin-top:14px"><label>How much came in?</label>' +
-      '<input class="input big money" id="pay-amt" placeholder="रू 0" inputmode="text" autocomplete="off">' +
+      '<input class="input big money" id="pay-amt" placeholder="Rs. 0" inputmode="text" autocomplete="off">' +
       '<div class="hint">Tap a quick amount or type — partial payments are fine.</div></div>' +
       '<div style="display:flex;gap:8px;margin-top:10px" id="pay-quick"></div>' +
       '<div class="field" style="margin-top:14px"><label>Note (optional)</label>' +
@@ -105,7 +115,7 @@ const Payment = {
     const quicks = [];
     if (bal >= 100) quicks.push(100, 500);
     if (bal > 500) quicks.push(Math.round(bal / 2));
-    quicks.push("ALL " + fmtMoney(bal));
+    quicks.push("Full clear " + fmtMoney(bal));
     el.querySelector("#pay-quick").innerHTML = quicks.map((q) => {
       const isAll = typeof q === "string";
       const v = isAll ? bal : q;
@@ -148,6 +158,10 @@ const Payment = {
     };
 
     el.querySelector("#pay-save").onclick = () => this.save(main);
+    if (this.prefillFull) {
+      amt.value = bal;
+      this.preview(main);
+    }
     setTimeout(() => amt.focus(), 60);
   },
 
@@ -200,7 +214,8 @@ const Payment = {
         const clearedTxt = this.plan && this.plan.length === 1 && this.plan[0].apply >= this.plan[0].bill_remaining - 0.004
           ? "cleared the " + fmtDate(this.plan[0].bill_at) + " bill fully"
           : (this.plan ? "cleared " + this.plan.length + " bill" + (this.plan.length === 1 ? "" : "s") + ", oldest first" : "");
-        toast("Payment saved" + (clearedTxt ? " — " + clearedTxt : ""), "ok", 3800);
+        toast("Payment saved" + (res.galla_in ? " — cash added to galla" : "") +
+          (clearedTxt ? " — " + clearedTxt : ""), "ok", 3800);
         App.go("ledger", { id: this.person.id });
       }).catch((e) => toast(e.message, "err"));
     };

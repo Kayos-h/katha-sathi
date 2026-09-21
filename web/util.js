@@ -54,7 +54,10 @@ function devToAscii(s) {
 }
 
 function toAmountFloat(s) {
-  let t = devToAscii(String(s || "")).replace(/[रूRs,\s]/g, "");
+  /* the money symbol goes first — the dot in "Rs." must never eat the
+     decimal point of "12.5" */
+  let t = String(s || "").replace(/रू|rs\.?|npr/gi, "");
+  t = devToAscii(t).replace(/[,\s]/g, "");
   // "1.2.3" is a typo, not 1.2 — refuse instead of silently reading it wrong
   if ((t.match(/\./g) || []).length > 1) return null;
   const f = parseFloat(t);
@@ -67,7 +70,7 @@ function fmtMoney(v, signed) {
   const abs = Math.abs(f);
   const str = abs.toLocaleString("en-IN", { minimumFractionDigits: f % 1 ? 2 : 0, maximumFractionDigits: 2 });
   const sign = f < 0 ? "-" : (signed && f > 0 ? "+" : "");
-  return sign + "रू " + str;
+  return sign + "Rs. " + str;
 }
 
 function fmtDate(iso) {

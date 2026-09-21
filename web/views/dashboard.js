@@ -43,7 +43,7 @@ const Dashboard = {
 
     /* KPI cards */
     html += kpi("Total to collect", fmtMoney(d.total_to_collect), d.people_open + " people owing", "wallet", "indigo");
-    html += kpi("Collected today", fmtMoney(today.collected), today.n_payments + " payments" + (today.collected_counter ? " + रू " + today.collected_counter + " paid at counter" : ""), "money", "green");
+    html += kpi("Collected today", fmtMoney(today.collected), today.n_payments + " payments" + (today.collected_counter ? " + " + fmtMoney(today.collected_counter) + " paid at counter" : ""), "money", "green");
     html += kpi("Billed today", fmtMoney(today.billed), today.n_bills + " bills", "bill", "amber");
     html += kpi("People", String(d.total_people), d.open_count + " open bills", "people", "red");
 

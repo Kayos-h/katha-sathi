@@ -116,6 +116,208 @@ def _quote_fn(name):
     return quote(name)
 
 
+def _qr_png_b64(url):
+    """Return a QR PNG as base64.
+
+    Prefer the qrcode package when installed; otherwise use a tiny built-in
+    Version 2-L byte-mode encoder, enough for the local IPv4 URLs this app
+    serves (for example http://192.168.1.69:8787).
+    """
+    try:
+        import qrcode
+        buf = io.BytesIO()
+        qrcode.make(url, box_size=8, border=2).save(buf, "PNG")
+        return base64.b64encode(buf.getvalue()).decode()
+    except ImportError:
+        pass
+    try:
+        return base64.b64encode(_fallback_qr_png(url)).decode()
+    except Exception:
+        return None
+
+
+def _fallback_qr_png(text):
+    data = text.encode("utf-8")
+    if len(data) > 32:
+        raise ValueError("Fallback QR supports up to 32 bytes")
+    data_cw = _qr_data_codewords(data)
+    ec_cw = _qr_rs_remainder(data_cw, 10)
+    matrix = _qr_matrix_v2_l(data_cw + ec_cw)
+    from PIL import Image, ImageDraw
+    scale, border = 8, 4
+    size = len(matrix)
+    img = Image.new("RGB", ((size + border * 2) * scale,
+                            (size + border * 2) * scale), "white")
+    draw = ImageDraw.Draw(img)
+    for y, row in enumerate(matrix):
+        for x, dark in enumerate(row):
+            if dark:
+                x0 = (x + border) * scale
+                y0 = (y + border) * scale
+                draw.rectangle([x0, y0, x0 + scale - 1, y0 + scale - 1], fill="black")
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def _qr_data_codewords(data):
+    bits = [0, 1, 0, 0]  # byte mode
+    bits += [(len(data) >> i) & 1 for i in range(7, -1, -1)]
+    for b in data:
+        bits += [(b >> i) & 1 for i in range(7, -1, -1)]
+    cap = 34 * 8  # QR version 2, error correction L
+    bits += [0] * min(4, cap - len(bits))
+    while len(bits) % 8:
+        bits.append(0)
+    out = []
+    for i in range(0, len(bits), 8):
+        v = 0
+        for bit in bits[i:i + 8]:
+            v = (v << 1) | bit
+        out.append(v)
+    pads = [0xEC, 0x11]
+    i = 0
+    while len(out) < 34:
+        out.append(pads[i % 2])
+        i += 1
+    return out
+
+
+def _qr_gf_tables():
+    exp = [0] * 512
+    log = [0] * 256
+    x = 1
+    for i in range(255):
+        exp[i] = x
+        log[x] = i
+        x <<= 1
+        if x & 0x100:
+            x ^= 0x11D
+    for i in range(255, 512):
+        exp[i] = exp[i - 255]
+    return exp, log
+
+
+def _qr_gf_mul(x, y):
+    if x == 0 or y == 0:
+        return 0
+    exp, log = _qr_gf_tables()
+    return exp[log[x] + log[y]]
+
+
+def _qr_rs_divisor(degree):
+    result = [0] * degree
+    result[degree - 1] = 1
+    root = 1
+    for _ in range(degree):
+        for j in range(degree):
+            result[j] = _qr_gf_mul(result[j], root)
+            if j + 1 < degree:
+                result[j] ^= result[j + 1]
+        root = _qr_gf_mul(root, 0x02)
+    return result
+
+
+def _qr_rs_remainder(data, degree):
+    divisor = _qr_rs_divisor(degree)
+    result = [0] * degree
+    for b in data:
+        factor = b ^ result.pop(0)
+        result.append(0)
+        for i, coef in enumerate(divisor):
+            result[i] ^= _qr_gf_mul(coef, factor)
+    return result
+
+
+def _qr_format_bits(mask):
+    data = (1 << 3) | mask  # EC level L = 01
+    rem = data << 10
+    for i in range(14, 9, -1):
+        if (rem >> i) & 1:
+            rem ^= 0x537 << (i - 10)
+    return ((data << 10) | rem) ^ 0x5412
+
+
+def _qr_matrix_v2_l(codewords):
+    size = 25
+    m = [[None for _ in range(size)] for _ in range(size)]
+
+    def setm(x, y, dark):
+        if 0 <= x < size and 0 <= y < size:
+            m[y][x] = bool(dark)
+
+    def reserve(x, y):
+        if 0 <= x < size and 0 <= y < size and m[y][x] is None:
+            m[y][x] = False
+
+    def finder(x, y):
+        for dy in range(-1, 8):
+            for dx in range(-1, 8):
+                xx, yy = x + dx, y + dy
+                if not (0 <= xx < size and 0 <= yy < size):
+                    continue
+                dark = (0 <= dx <= 6 and 0 <= dy <= 6 and
+                        (dx in (0, 6) or dy in (0, 6) or
+                         (2 <= dx <= 4 and 2 <= dy <= 4)))
+                setm(xx, yy, dark)
+
+    finder(0, 0)
+    finder(size - 7, 0)
+    finder(0, size - 7)
+    for i in range(8, size - 8):
+        setm(i, 6, i % 2 == 0)
+        setm(6, i, i % 2 == 0)
+    for dy in range(-2, 3):
+        for dx in range(-2, 3):
+            dist = max(abs(dx), abs(dy))
+            setm(18 + dx, 18 + dy, dist != 1)
+    setm(8, size - 8, True)
+    for i in range(9):
+        reserve(8, i)
+        reserve(i, 8)
+    for i in range(8):
+        reserve(size - 1 - i, 8)
+    for i in range(7):
+        reserve(8, size - 7 + i)
+
+    bits = []
+    for b in codewords:
+        bits += [(b >> i) & 1 for i in range(7, -1, -1)]
+    bit_i = 0
+    upward = True
+    x = size - 1
+    while x > 0:
+        if x == 6:
+            x -= 1
+        for vert in range(size):
+            y = size - 1 - vert if upward else vert
+            for dx in range(2):
+                xx = x - dx
+                if m[y][xx] is not None:
+                    continue
+                dark = bit_i < len(bits) and bits[bit_i] == 1
+                if (xx + y) % 2 == 0:
+                    dark = not dark
+                m[y][xx] = dark
+                bit_i += 1
+        upward = not upward
+        x -= 2
+
+    fmt = _qr_format_bits(0)
+    for i in range(6):
+        setm(8, i, (fmt >> i) & 1)
+    setm(8, 7, (fmt >> 6) & 1)
+    setm(8, 8, (fmt >> 7) & 1)
+    setm(7, 8, (fmt >> 8) & 1)
+    for i in range(9, 15):
+        setm(14 - i, 8, (fmt >> i) & 1)
+    for i in range(8):
+        setm(size - 1 - i, 8, (fmt >> i) & 1)
+    for i in range(8, 15):
+        setm(8, size - 15 + i, (fmt >> i) & 1)
+    return [[bool(c) for c in row] for row in m]
+
+
 def find_lan_ip():
     """The LAN address the phone should open (QR code target)."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -143,7 +345,7 @@ def parse_amount(val):
         "०": "0", "१": "1", "२": "2", "३": "3", "४": "4",
         "५": "5", "६": "6", "७": "7", "८": "8", "९": "9",
     }
-    s = str(val or "").strip()
+    s = "" if val is None else str(val).strip()
     for k, v in DEV.items():
         s = s.replace(k, v)
     s = s.replace("रू", "").replace("Rs", "").replace("rs", "").replace("NPR", "").replace(" ", "")
@@ -289,14 +491,7 @@ class Handler(BaseHTTPRequestHandler):
         ip = find_lan_ip()
         port = self.server.server_address[1]
         url = "http://%s:%d" % (ip, port)
-        qr_b64 = None
-        try:
-            import qrcode
-            buf = io.BytesIO()
-            qrcode.make(url, box_size=8, border=2).save(buf, "PNG")
-            qr_b64 = base64.b64encode(buf.getvalue()).decode()
-        except ImportError:
-            pass
+        qr_b64 = _qr_png_b64(url)
         return self._json(200, {"url": url, "qr_png_b64": qr_b64})
 
     # ---- SSE ----
@@ -304,6 +499,7 @@ class Handler(BaseHTTPRequestHandler):
     def _sse(self):
         # EventSource cannot send headers, so the token may also arrive as
         # ?token= or via the session cookie.
+        self.close_connection = True
         token = self._token()
         qs = self.path.split("?", 1)[1] if "?" in self.path else ""
         for kv in qs.split("&"):
@@ -684,9 +880,12 @@ class Handler(BaseHTTPRequestHandler):
         person_name = (d.get("person_name") or "").strip()
         if not person_id and not person_name:
             return self._err(400, "Pick a person or type a new name")
+        amount = parse_amount(d.get("amount"))
+        paid_raw = str(d.get("paid_amount") or "").strip()
+        paid_amount = parse_amount(paid_raw) if paid_raw else 0
+        db.require_galla_open()
         if not person_id:
             person_id = db.create_person(person_name, d.get("phone") or "")
-        amount = parse_amount(d.get("amount"))
         photo = ""
         if d.get("photo_b64"):
             try:
@@ -699,7 +898,8 @@ class Handler(BaseHTTPRequestHandler):
             photo = photos.save_photo(raw, ext)
         res = db.create_bill(
             person_id, amount, photo=photo, note=d.get("note") or "",
-            already_paid=bool(d.get("already_paid")),
+            already_paid=bool(d.get("already_paid")), paid_amount=paid_amount,
+            paid_note=d.get("paid_note") or "",
         )
         res["person_id"] = person_id
         return self._json(200, res)
@@ -711,8 +911,11 @@ class Handler(BaseHTTPRequestHandler):
         person_name = (d.get("person_name") or "").strip()
         if not person_id and not person_name:
             return self._err(400, "Pick a person or type a new name")
+        db.require_galla_open()
         if not person_id:
             person_id = db.create_person(person_name, d.get("phone") or "")
+        paid_raw = str(d.get("paid_amount") or "").strip()
+        paid_amount = parse_amount(paid_raw) if paid_raw else 0
         photo = ""
         if d.get("photo_b64"):
             try:
@@ -725,7 +928,8 @@ class Handler(BaseHTTPRequestHandler):
             photo = photos.save_photo(raw, ext)
         res = db.create_itemized_bill(
             person_id, d.get("items"), photo=photo, note=d.get("note") or "",
-            already_paid=bool(d.get("already_paid")),
+            already_paid=bool(d.get("already_paid")), paid_amount=paid_amount,
+            paid_note=d.get("paid_note") or "",
         )
         res["person_id"] = person_id
         return self._json(200, res)
@@ -733,6 +937,7 @@ class Handler(BaseHTTPRequestHandler):
     def _api_payment_add(self):
         d = read_json(self)
         amount = parse_amount(d.get("amount"))
+        db.require_galla_open()
         photo = ""
         if d.get("photo_b64"):
             try:
@@ -750,6 +955,15 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(200, res)
 
 
+class QuietThreadingHTTPServer(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionAbortedError,
+                            ConnectionResetError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
 # ---------------- main ----------------
 
 def run(host="0.0.0.0", port=8787, open_browser=True):
@@ -758,7 +972,7 @@ def run(host="0.0.0.0", port=8787, open_browser=True):
     srv = None
     for p in ([port] + list(range(port, port + 20))):
         try:
-            srv = ThreadingHTTPServer((host, p), Handler)
+            srv = QuietThreadingHTTPServer((host, p), Handler)
             break
         except OSError:
             continue
@@ -770,7 +984,7 @@ def run(host="0.0.0.0", port=8787, open_browser=True):
     url = "http://%s:%d" % (ip, actual_port)
     print("Khata Sathi is running.")
     print("  On this laptop :  http://localhost:%d" % actual_port)
-    print("  On the phone   :  %s   (scan the QR in the app - top right \u2630)" % url)
+    print("  On the phone   :  %s   (scan the QR in the app - top right menu)" % url)
     if open_browser:
         threading.Timer(0.5, lambda: webbrowser.open("http://localhost:%d" % actual_port)).start()
     try:

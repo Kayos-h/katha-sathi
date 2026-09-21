@@ -119,7 +119,7 @@ const BillMaker = {
       const f = inp.getAttribute("data-f");
       let v = devToAscii(inp.value);
       if (f !== "particulars") {
-        v = v.replace(/[^\d.]/g, "");
+        v = v.replace(/रू|rs\.?|npr/gi, "").replace(/[^\d.]/g, "");
         /* one dot max: "1.2.3" is a typo, never a number */
         const first = v.indexOf(".");
         if (first !== -1) v = v.slice(0, first + 1) + v.slice(first + 1).replace(/\./g, "");
@@ -169,6 +169,29 @@ const BillMaker = {
     if (!side) return;
     const total = this.items.reduce((s, it) => s + (toAmountFloat(it.amount) || 0), 0);
     side.textContent = fmtMoney(total);
+    this.paintPaidPreview(main);
+  },
+
+  paintPaidPreview(main) {
+    const paidEl = main.querySelector("#bm-paid-now");
+    const paidFull = main.querySelector("#bm-paid");
+    const hint = main.querySelector("#bm-paid-hint");
+    if (!paidEl || !paidFull || !hint) return;
+    const total = this.items.reduce((s, it) => s + (toAmountFloat(it.amount) || 0), 0);
+    if (paidFull.checked) {
+      paidEl.value = "";
+      paidEl.disabled = true;
+      hint.textContent = "Full amount is marked paid at the counter.";
+      return;
+    }
+    paidEl.disabled = false;
+    const paid = toAmountFloat(paidEl.value) || 0;
+    if (paid > 0) {
+      const rest = Math.max(0, total - paid);
+      hint.textContent = fmtMoney(paid) + " will be recorded as paid; " + fmtMoney(rest) + " stays in the khata.";
+    } else {
+      hint.textContent = "Leave empty for full credit, or enter the amount paid now.";
+    }
   },
 
   /* ---------- side: photo + save ---------- */
@@ -176,7 +199,10 @@ const BillMaker = {
     const el = main.querySelector("#bm-side");
     el.innerHTML =
       '<div class="panel-title">' + ico("doc") + "Bill summary</div>" +
-      '<div class="bm-total-row"><span>TOTAL</span><div class="bm-total money" id="bm-total">रू 0</div></div>' +
+      '<div class="bm-total-row"><span>TOTAL</span><div class="bm-total money" id="bm-total">Rs. 0</div></div>' +
+      '<div class="field" style="margin-top:14px"><label>Paid now (optional)</label>' +
+      '<input class="input money" id="bm-paid-now" placeholder="Rs. 0" inputmode="text" autocomplete="off">' +
+      '<div class="hint" id="bm-paid-hint">Leave empty for full credit, or enter the amount paid now.</div></div>' +
       '<div class="field" style="margin-top:14px"><label>Note (optional)</label>' +
       '<input class="input" id="bm-note" placeholder="e.g. monthly ration"></div>' +
       '<div class="check-row" style="margin-top:14px">' +
@@ -187,8 +213,18 @@ const BillMaker = {
       '<div style="margin-top:18px" id="bm-photo-box"></div>' +
       '<button class="btn primary lg block" id="bm-save" style="margin-top:16px">' + ico("check") + "Save bill</button>";
 
+    const paidNow = el.querySelector("#bm-paid-now");
+    paidNow.addEventListener("input", () => {
+      const v = devToAscii(paidNow.value).replace(/रू|rs\.?|npr/gi, "").replace(/[^\d.]/g, "");
+      const first = v.indexOf(".");
+      const cleaned = first === -1 ? v : v.slice(0, first + 1) + v.slice(first + 1).replace(/\./g, "");
+      if (cleaned !== paidNow.value) paidNow.value = cleaned;
+      this.paintPaidPreview(main);
+    });
+    el.querySelector("#bm-paid").addEventListener("change", () => this.paintPaidPreview(main));
     el.querySelector("#bm-save").onclick = () => this.save(main);
     this.renderPhotoBox(main);
+    this.paintTotal(main);
   },
 
   renderPhotoBox(main) {
@@ -237,6 +273,7 @@ const BillMaker = {
     const phone = main.querySelector("#bm-phone").value.trim();
     const note = main.querySelector("#bm-note").value.trim();
     const alreadyPaid = main.querySelector("#bm-paid").checked;
+    const paidRaw = main.querySelector("#bm-paid-now").value.trim();
 
     if (!name) { toast("Type who the bill is for", "err"); main.querySelector("#bm-name").focus(); return; }
 
@@ -251,6 +288,11 @@ const BillMaker = {
       }
     });
     if (!items.length) { toast("Add at least one item (particulars + rate or amount)", "err"); return; }
+    const total = items.reduce((s, it) => s + it.amount, 0);
+    const paidNow = paidRaw ? toAmountFloat(paidRaw) : 0;
+    if (paidNow === null || paidNow < 0) { toast("Enter a valid paid amount", "err"); return; }
+    if (alreadyPaid && paidNow > 0) { toast("Use either already paid or paid now, not both", "err"); return; }
+    if (paidNow > total + 0.004) { toast("Paid amount cannot be more than the bill total", "err"); return; }
 
     const payload = {
       person_id: this.personId || undefined,
@@ -258,6 +300,8 @@ const BillMaker = {
       phone: this.personId ? undefined : phone,
       note,
       already_paid: alreadyPaid,
+      paid_amount: paidNow > 0 ? paidNow : undefined,
+      paid_note: paidNow > 0 ? "paid while making bill" : undefined,
       items,
     };
 
@@ -265,7 +309,8 @@ const BillMaker = {
       if (photoB64) payload.photo_b64 = photoB64;
       API.post("/api/bills/itemized/add", payload).then((res) => {
         let msg = "Bill " + res.bill_no + " saved — " + fmtMoney(res.amount);
-        if (alreadyPaid && res.galla_in) msg += " · cash added to today's galla";
+        if ((alreadyPaid || paidNow > 0) && res.galla_in) msg += " · cash added to today's galla";
+        if (paidNow > 0) msg += " · " + fmtMoney(paidNow) + " paid, " + fmtMoney(res.remaining) + " left";
         toast(msg, "ok", 4200);
         this.shareDialog(res, name);
       }).catch((e) => toast(e.message, "err"));

@@ -137,6 +137,18 @@ def main():
     st, d = req("GET", "/api/search?q=SITA")
     check("search case-insensitive", st == 200 and len(d["results"]) == 1, d)
 
+    print("\n== galla day start gate ==")
+    st, d = req("GET", "/api/galla")
+    check("galla not open yet", st == 200 and d["open"] is False, d)
+    st, d = req("POST", "/api/bills/add", {"person_id": ram, "amount": 1})
+    check("bill before galla open blocked", st == 400 and "galla" in d.get("error", "").lower(), d)
+    st, d = req("POST", "/api/galla/entry", {"direction": "in", "amount": 100})
+    check("entry before open blocked", st == 400, st)
+    st, d = req("POST", "/api/galla/open", {"opening": "रू ५,०००"})
+    check("galla opens with devanagari amount", st == 200 and d["opening"] == 5000.0, d)
+    st, d = req("POST", "/api/galla/open", {"opening": 100})
+    check("double open blocked", st == 400, st)
+
     print("\n== bills + photo gate ==")
     photo = sharp_photo_bytes()
     st, d = req("POST", "/api/photo/check", raw=photo, ctype="image/jpeg", auth=False)
@@ -154,13 +166,27 @@ def main():
     check("plain bill", st == 200, d)
     st, d = req("POST", "/api/bills/add", {"person_id": ram, "amount": 800, "already_paid": True})
     b3 = d["id"]
-    check("already-paid bill", st == 200, d)
+    check("already-paid bill", st == 200 and d.get("galla_in") is True, d)
     st, d = req("POST", "/api/bills/add", {"person_id": sita, "amount": "1,000"})
     check("comma amount parsed", st == 200, d)
     st, d = req("POST", "/api/bills/add", {"person_name": "Hari New", "amount": 300})
     check("new person via bill", st == 200, d)
     st, d = req("POST", "/api/bills/add", {"person_id": ram, "amount": -5})
     check("negative amount rejected", st == 400, d)
+    st, d = req("POST", "/api/people/add", {"name": "Paid Now Test"})
+    pnt = d["id"]
+    check("person for paid-now bill", st == 200, d)
+    st, d = req("POST", "/api/bills/add", {
+        "person_id": pnt, "amount": 750, "paid_amount": 200})
+    check("paid-now bill records remaining", st == 200 and d.get("remaining") == 550.0
+          and d.get("payment_id") and d.get("galla_in") is True, d)
+    st, d = req("GET", "/api/ledger?id=" + pnt)
+    kinds = [r["kind"] for r in d["rows"]]
+    check("paid-now ledger has bill and payment", st == 200 and kinds == ["bill", "payment"]
+          and d["balance"] == 550.0, d)
+    st, d = req("POST", "/api/bills/add", {
+        "person_id": pnt, "amount": 100, "paid_amount": 150})
+    check("paid-now over bill total rejected", st == 400, d)
 
     print("\n== ledger + balance ==")
     st, d = req("GET", "/api/ledger?id=" + ram)
@@ -175,7 +201,7 @@ def main():
     st, d = req("POST", "/api/payments/preview", {"person_id": ram, "amount": 1500})
     check("preview plan", st == 200 and [p["apply"] for p in d["plan"]] == [1234.0, 266.0], d)
     st, d = req("POST", "/api/payments/add", {"person_id": ram, "amount": 1500, "note": "cash"})
-    check("payment recorded", st == 200 and d.get("id"), d)
+    check("payment recorded", st == 200 and d.get("id") and d.get("galla_in") is True, d)
     pmt = d["id"]
     st, d = req("GET", "/api/ledger?id=" + ram)
     check("balance after payment = 234", d["balance"] == 234.0, d["balance"])
@@ -291,14 +317,17 @@ def main():
     print("\n== SSE ==")
     events = []
     def listen():
-        r = urllib.request.Request(BASE + "/api/events", headers={"Authorization": "Bearer " + TOKEN})
-        with urllib.request.urlopen(r, timeout=10) as resp:
-            start = time.time()
-            for line in resp:
-                if time.time() - start > 6:
-                    break
-                if line.startswith(b"data:"):
-                    events.append(json.loads(line[5:].decode()))
+        try:
+            r = urllib.request.Request(BASE + "/api/events", headers={"Authorization": "Bearer " + TOKEN})
+            with urllib.request.urlopen(r, timeout=10) as resp:
+                start = time.time()
+                for line in resp:
+                    if time.time() - start > 6:
+                        break
+                    if line.startswith(b"data:"):
+                        events.append(json.loads(line[5:].decode()))
+        except TimeoutError:
+            pass
     t = threading.Thread(target=listen, daemon=True)
     t.start()
     time.sleep(1.0)
@@ -367,6 +396,17 @@ def main():
     check("itemized bill fully paid", d["status"] == "paid" and d["remaining"] == 0, d)
     st, d = req("GET", "/api/person?id=" + ganga)
     check("ganga balance only ib2 left", abs(d["balance"] - 360.0) < 0.01, d["balance"])
+    st, d = req("POST", "/api/bills/itemized/add", {
+        "person_id": ganga,
+        "items": [{"particulars": "Flour", "qty": 5, "rate": 100, "amount": 500}],
+        "paid_amount": 125,
+    })
+    check("itemized paid-now bill", st == 200 and d.get("remaining") == 375.0
+          and d.get("payment_id"), d)
+    st, d = req("GET", "/api/ledger?id=" + ganga)
+    check("itemized paid-now balance keeps only rest", st == 200 and
+          abs(d["balance"] - 735.0) < 0.01 and
+          any(r["kind"] == "payment" and r["amount"] == 125.0 for r in d["rows"]), d["balance"])
 
     print("\n== bill share PDF ==")
     def raw_get2(path):
@@ -383,13 +423,9 @@ def main():
 
     print("\n== galla (the cash drawer) ==")
     st, d = req("GET", "/api/galla")
-    check("galla not open yet", st == 200 and d["open"] is False, d)
-    st, d = req("POST", "/api/galla/entry", {"direction": "in", "amount": 100})
-    check("entry before open blocked", st == 400, st)
-    st, d = req("POST", "/api/galla/open", {"opening": "रू ५,०००"})
-    check("galla opens with devanagari amount", st == 200 and d["opening"] == 5000.0, d)
-    st, d = req("POST", "/api/galla/open", {"opening": 100})
-    check("double open blocked", st == 400, st)
+    check("galla is already open for the business day", st == 200 and d["open"] is True
+          and d["opening"] == 5000.0 and d["closed"] is False, d)
+    base_cash_in = d["cash_in"]
     st, d = req("POST", "/api/galla/entry", {"direction": "out", "amount": 300, "note": "vegetables"})
     check("galla out entry", st == 200, d)
     st, d = req("POST", "/api/galla/entry", {"direction": "in", "amount": 1500, "note": "loan returned"})
@@ -400,14 +436,15 @@ def main():
     check("zero entry rejected", st == 400, st)
     st, d = req("GET", "/api/galla")
     check("galla summary math", st == 200 and d["open"] is True
-          and d["opening"] == 5000.0 and d["cash_in"] == 1500.0
+          and d["opening"] == 5000.0 and d["cash_in"] == base_cash_in + 1500.0
           and d["cash_out"] == 300.0 and d["expected"] == 6200.0
-          and d["closed"] is False, d)
+          + base_cash_in and d["closed"] is False, d)
     out_entry = [e for e in d["entries"] if e["direction"] == "out"][0]
     st, d = req("POST", "/api/galla/entry/undo", {"id": out_entry["id"]})
     check("galla entry undo", st == 200, st)
     st, d = req("GET", "/api/galla")
-    check("expected after undo = 6500", d["expected"] == 6500.0 and d["cash_out"] == 0.0, d)
+    check("expected after undo", d["expected"] == 6500.0 + base_cash_in
+          and d["cash_out"] == 0.0, d)
     st, d = req("POST", "/api/galla/entry", {"direction": "out", "amount": 300, "note": "vegetables"})
     check("re-add out entry", st == 200, st)
     print("\n== counter-paid bills go into today's galla ==")
@@ -416,47 +453,27 @@ def main():
     check("counter bill saved + galla_in flag", st == 200 and d.get("galla_in") is True, d)
     c_bill = d["id"]
     st, d = req("GET", "/api/galla")
-    check("counter cash entered the galla", st == 200 and d["cash_in"] == 1800.0
-          and d["expected"] == 6500.0, d)
-    linked = [e for e in d["entries"] if e.get("bill_id")]
-    check("entry is linked to the bill", len(linked) == 1
-          and linked[0]["bill_id"] == c_bill, d["entries"])
+    check("counter cash entered the galla", st == 200
+          and d["cash_in"] == base_cash_in + 1800.0
+          and d["expected"] == 6500.0 + base_cash_in, d)
+    linked = [e for e in d["entries"] if e.get("bill_id") == c_bill]
+    check("entry is linked to the bill", len(linked) == 1, d["entries"])
     st, d = req("POST", "/api/galla/entry/undo", {"id": linked[0]["id"]})
     check("linked entry can't be removed by hand", st == 400, (st, d))
     st, d = req("POST", "/api/bills/void", {"id": c_bill})
     check("voiding the counter bill", st == 200, st)
     st, d = req("GET", "/api/galla")
-    check("void pulled the cash back out", st == 200 and d["cash_in"] == 1500.0
-          and d["expected"] == 6200.0, d)
+    check("void pulled the cash back out", st == 200
+          and d["cash_in"] == base_cash_in + 1500.0
+          and d["expected"] == 6200.0 + base_cash_in, d)
     # backdated bills never touch today's drawer (db-level: the API only
     # ever records real-time dates)
     bd = db.create_person("Backdate Test")
     res = db.create_bill(bd, 250, already_paid=True, created_at="2020-01-01T10:00:00")
     check("backdated counter bill skips the galla", res.get("galla_in") is False, res)
     st, d = req("GET", "/api/galla")
-    check("drawer unchanged by backdated bill", st == 200 and d["cash_in"] == 1500.0, d)
-
-    st, d = req("POST", "/api/galla/close", {"closing": 5700})
-    check("close short by 500", st == 200, d)
-    st, d = req("GET", "/api/galla")
-    check("closed with difference -500", st == 200 and d["closed"] is True
-          and abs(d["difference"] - (-500.0)) < 0.01, d)
-    st, d = req("POST", "/api/galla/entry", {"direction": "in", "amount": 10})
-    check("entry after close blocked", st == 400, st)
-    st, d = req("POST", "/api/galla/close", {"closing": 100})
-    check("double close blocked", st == 400, st)
-    st, d = req("GET", "/api/galla/recent?days=7")
-    today_s = time.strftime("%Y-%m-%d")
-    row = [r for r in d["days"] if r["date"] == today_s]
-    check("recent days include in/out", st == 200 and row and
-          row[0]["cash_in"] == 1500.0 and row[0]["cash_out"] == 300.0, d.get("days"))
-    st, d = req("GET", "/api/galla/recent?days=7")
-    check("galla recent shows the day", st == 200 and len(d["days"]) == 1
-          and d["days"][0]["closing"] == 5700.0
-          and d["days"][0]["difference"] == -500.0, d)
-    st, body, hdrs = raw_get2("/api/galla/pdf")
-    check("galla pdf 200", st == 200 and body[:8] == b"%PDF-1.4", (st, len(body)))
-    check("galla pdf valid", b"/Type /Catalog" in body and b"%%EOF" in body[-32:], None)
+    check("drawer unchanged by backdated bill", st == 200
+          and d["cash_in"] == base_cash_in + 1500.0, d)
 
     print("\n== per-bill partial payments ==")
     # fresh person with two bills so FIFO vs bill-target can't be confused
@@ -513,11 +530,13 @@ def main():
     check("snapshot has bill_items", "bill_items" in snap and len(snap["bill_items"]) >= 4,
           len(snap.get("bill_items", [])))
     check("snapshot has galla tables", "galla_days" in snap and "galla_entries" in snap
-          and len(snap["galla_days"]) == 1, len(snap.get("galla_days", [])))
+          and len(snap["galla_days"]) == 1
+          and any(e.get("payment_id") for e in snap["galla_entries"]),
+          len(snap.get("galla_entries", [])))
     st, d = req("POST", "/api/backup/restore", {"snapshot": snap})
     check("restore with new tables", st == 200, st)
     st, d = req("GET", "/api/galla")
-    check("galla survives restore", st == 200 and d["open"] is True and d["closed"] is True, d)
+    check("galla survives restore", st == 200 and d["open"] is True and d["closed"] is False, d)
     st, d = req("GET", "/api/bill?id=" + ib1)
     check("bill items survive restore", st == 200 and len(d.get("items", [])) == 2, len(d.get("items", [])))
 
@@ -582,6 +601,36 @@ def main():
     })
     check("tiny amount still a bill", st == 200, (st, d))
 
+    print("\n== close galla ==")
+    st, d = req("GET", "/api/galla")
+    expected_before_close = d["expected"]
+    cash_in_before_close = d["cash_in"]
+    cash_out_before_close = d["cash_out"]
+    closing_amount = round(expected_before_close - 500.0, 2)
+    st, d = req("POST", "/api/galla/close", {"closing": closing_amount})
+    check("close short by 500", st == 200, d)
+    st, d = req("GET", "/api/galla")
+    check("closed with difference -500", st == 200 and d["closed"] is True
+          and abs(d["difference"] - (-500.0)) < 0.01, d)
+    st, d = req("POST", "/api/galla/entry", {"direction": "in", "amount": 10})
+    check("entry after close blocked", st == 400, st)
+    st, d = req("POST", "/api/payments/add", {"person_id": ppt, "amount": 10, "bill_id": pb2})
+    check("payment after close blocked", st == 400, (st, d))
+    st, d = req("POST", "/api/galla/close", {"closing": 100})
+    check("double close blocked", st == 400, st)
+    st, d = req("GET", "/api/galla/recent?days=7")
+    today_s = time.strftime("%Y-%m-%d")
+    row = [r for r in d["days"] if r["date"] == today_s]
+    check("recent days include in/out", st == 200 and row and
+          row[0]["cash_in"] == cash_in_before_close
+          and row[0]["cash_out"] == cash_out_before_close, d.get("days"))
+    check("galla recent shows the day", st == 200 and len(d["days"]) == 1
+          and d["days"][0]["closing"] == closing_amount
+          and d["days"][0]["difference"] == -500.0, d)
+    st, body, hdrs = raw_get2("/api/galla/pdf")
+    check("galla pdf 200", st == 200 and body[:8] == b"%PDF-1.4", (st, len(body)))
+    check("galla pdf valid", b"/Type /Catalog" in body and b"%%EOF" in body[-32:], None)
+
     print("\n== clear all data (remove demo) ==")
     st, d = req("POST", "/api/demo/clear", {})
     check("clear returns ok", st == 200, (st, d))
@@ -601,6 +650,8 @@ def main():
     # demo loader must survive itemized bills too (FK order)
     st, d = req("POST", "/api/people/add", {"name": "Itemized One"})
     io_id = d["id"]
+    st, d = req("POST", "/api/galla/open", {"opening": "0"})
+    check("open galla before real itemized bill after demo", st == 200, (st, d))
     st, d = req("POST", "/api/bills/itemized/add", {"person_id": io_id,
         "items": [{"particulars": "x", "qty": 1, "rate": 10}]})
     check("itemized bill before demo reload", st == 200, (st, d))

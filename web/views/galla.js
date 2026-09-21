@@ -83,7 +83,7 @@ const Galla = {
       "This is today's opening galla — coins, notes, the float.</div>" +
       '<div class="field" style="max-width:340px;margin-top:14px">' +
       '<label>Cash at the start of the day</label>' +
-      '<input class="input big money" id="go-amt" placeholder="रू 0" inputmode="text"></div>' +
+      '<input class="input big money" id="go-amt" placeholder="Rs. 0" inputmode="text"></div>' +
       '<div class="field" style="max-width:340px;margin-top:12px">' +
       '<label>Note (optional)</label><input class="input" id="go-note" placeholder="e.g. after yesterday\'s 5000"></div>' +
       '<button class="btn primary lg" id="go-open" style="margin-top:16px">' + ico("check") + "Open today's galla</button>" +
@@ -115,15 +115,18 @@ const Galla = {
     for (const e of d.entries) {
       const isIn = e.direction === "in";
       const counter = !!e.bill_id;
+      const payment = !!e.payment_id;
+      const locked = counter || payment;
       entriesHtml +=
         '<div class="ge-row">' +
         '<div class="ge-badge ' + (isIn ? "in" : "out") + '">' + ico(isIn ? "plus" : "minus") + "</div>" +
         '<div><div class="ge-note">' + escapeHtml(e.note || (isIn ? "cash in" : "cash out")) +
-        (counter ? ' <span class="pill counter">bill</span>' : "") + "</div>" +
+        (counter ? ' <span class="pill counter">bill</span>' : "") +
+        (payment ? ' <span class="pill paid">payment</span>' : "") + "</div>" +
         '<div class="ge-time">' + (e.at || "").slice(11, 16) + "</div></div>" +
-        (closed || counter ? "" : '<button class="icon-btn ge-del" data-eid="' + e.id + '" title="Remove this entry">' + ico("trash") + "</button>") +
-        (counter && !closed
-          ? '<span class="hint" style="align-self:center">void the bill to undo</span>' : "") +
+        (closed || locked ? "" : '<button class="icon-btn ge-del" data-eid="' + e.id + '" title="Remove this entry">' + ico("trash") + "</button>") +
+        (locked && !closed
+          ? '<span class="hint" style="align-self:center">' + (payment ? "undo payment to undo" : "void the bill to undo") + "</span>" : "") +
         '<div class="ge-amt money ' + (isIn ? "pos" : "neg") + '">' + (isIn ? "+" : "−") + fmtMoney(e.amount) + "</div>" +
         "</div>";
     }
@@ -180,7 +183,7 @@ const Galla = {
       (isIn ? "Money put INTO the drawer — someone returned a loan, you added float." :
         "Money taken OUT of the drawer — spending, a bank deposit, cash taken home.") + "</div>" +
       '<div class="field"><label>Amount</label>' +
-      '<input class="input big money" id="ge-amt" placeholder="रू 0" inputmode="text"></div>' +
+      '<input class="input big money" id="ge-amt" placeholder="Rs. 0" inputmode="text"></div>' +
       '<div class="field" style="margin-top:12px"><label>Note (what was it?)</label>' +
       '<input class="input" id="ge-note" placeholder="' +
       (isIn ? "e.g. loan returned" : "e.g. vegetables, bank deposit") + '"></div>';
@@ -219,7 +222,7 @@ const Galla = {
       "Count every coin and note in the drawer and enter what you counted. " +
       "The book says there should be <b>" + fmtMoney(d.expected) + "</b>.</div>" +
       '<div class="field"><label>Counted cash at the end of the day</label>' +
-      '<input class="input big money" id="gc-amt" placeholder="रू 0" inputmode="text"></div>';
+      '<input class="input big money" id="gc-amt" placeholder="Rs. 0" inputmode="text"></div>';
     modal({
       title: "Close today's galla",
       body,

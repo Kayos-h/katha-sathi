@@ -70,15 +70,17 @@ the laptop:
 ## Money rules (the important ones)
 
 - **The confirm screen is the law.** Nothing saves without a human tap.
+- Open today's **Galla** before entering bills or payments. This keeps the
+  day book, khata, and drawer in one flow.
 - A bill photo too bad to read later → Khata Sathi asks for a retake **before** accepting it.
 - Payments clear the **oldest bills first**, and the payment record says which.
 - **Pay one bill**: open a bill from the ledger, tap **Pay this bill**, pay any part of it.
-  The bill shows part-paid, then paid when finished. Overpaying that one bill is refused;
-  undo works like any payment.
+  The bill shows part-paid, then paid when finished. Every payment also lands in
+  today's galla; overpaying that one bill is refused, and undo works like any payment.
 - Undo a payment → balances come back exactly; the bills it cleared reopen.
 - Void a bill only if no payment is linked (undo the payment first).
-- "Already paid at counter" → no balance is owed, and the cash is added to
-  today's galla automatically. Void the bill and it comes back out of the drawer.
+- "Already paid at counter" or "paid now" on a bill → the cash is added to
+  today's galla automatically. Void/undo the source and it comes back out of the drawer.
 - Every change lands in the **audit trail** (Settings) — nothing vanishes silently.
 - Names in Nepali (Devanagari) or English both work everywhere, including search.
 - One-tap **statement** per person — copy-paste and send.

@@ -111,10 +111,11 @@ const LedgerView = {
     box.innerHTML =
       '<div class="panel khata-paper" id="lh-paper">' +
       '<div class="khata-head">' +
-      '<div class="khata-title">खाता <span class="dev">— ' + escapeHtml(p.name) + "</span></div>" +
+      '<div class="khata-title">Khata <span class="dev">— ' + escapeHtml(p.name) + "</span></div>" +
       '<div class="khata-sub">' + escapeHtml(App.state.store_name || "Khata Sathi") + "</div>" +
       '<div class="khata-head-actions">' +
-      (owing ? '<button class="btn success sm" data-a="pay">' + ico("money") + "Got money</button>" : "") +
+      (owing ? '<button class="btn success sm" data-a="pay-full">' + ico("check") + "Full clear</button>" +
+      '<button class="btn sm" data-a="pay">' + ico("money") + "Pay little</button>" : "") +
       '<button class="btn primary sm" data-a="share">' + ico("share") + "Share</button>" +
       '<button class="btn sm" data-a="print">' + ico("doc") + "Print</button>" +
       "</div></div>" +
@@ -127,20 +128,20 @@ const LedgerView = {
       "</div>" +
       '<table class="khata-table"><thead><tr>' +
       "<th>S.N.</th>" +
-      '<th class="date-col">मिति<span class="hide-sm"> Date</span></th>' +
-      '<th class="part-col">विवरण Particulars</th>' +
-      '<th class="num">डेबिट Debit</th>' +
-      '<th class="num">क्रेडिट Credit</th>' +
-      '<th class="num">बाँकी Remaining</th>' +
+      '<th class="date-col">Date</th>' +
+      '<th class="part-col">Particulars</th>' +
+      '<th class="num">Debit</th>' +
+      '<th class="num">Credit</th>' +
+      '<th class="num">Remaining</th>' +
       "</tr></thead><tbody>" + rows + "</tbody>" +
       '<tfoot><tr class="khata-totals">' +
-      '<td colspan="3" class="t-label">जम्मा Total</td>' +
+      '<td colspan="3" class="t-label">Total</td>' +
       '<td class="num k-dr">' + fmtMoney(totalDr) + "</td>" +
       '<td class="num k-cr">' + fmtMoney(totalCr) + "</td>" +
       '<td class="num">' + fmtMoney(d.balance) + "</td>" +
       "</tr></tfoot></table>" +
       '<div class="khata-grand">' +
-      '<span class="g-lbl">' + (owing ? "बाँकी Balance owed</span>" : "सबै चुक्ता All clear</span>") +
+      '<span class="g-lbl">' + (owing ? "Balance owed</span>" : "All clear</span>") +
       '<span class="g-val money ' + (owing ? "neg" : "pos") + '">' + fmtMoney(d.balance) + "</span></div>" +
       "</div>";
 
@@ -151,6 +152,7 @@ const LedgerView = {
       const b = e.target.closest("[data-a]");
       if (!b) return;
       const a = b.getAttribute("data-a");
+      if (a === "pay-full") App.go("pay", { id: p.id, full: true });
       if (a === "pay") App.go("pay", { id: p.id });
       if (a === "print") window.print();
       if (a === "share") Ledger.shareDialog(d, p);

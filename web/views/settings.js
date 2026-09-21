@@ -224,7 +224,7 @@ function auditSummary(a) {
   try {
     const d = JSON.parse(a.detail);
     if (d.name) return d.name;
-    if (d.amount !== undefined) return "रू " + d.amount + (d.note ? " · " + d.note : "");
+    if (d.amount !== undefined) return "Rs. " + d.amount + (d.note ? " · " + d.note : "");
     if (d.kept) return d.kept + " ← " + d.merged_in;
     if (d.before && d.after) return JSON.stringify(d.after);
     return "";

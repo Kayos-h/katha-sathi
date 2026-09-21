@@ -14,7 +14,11 @@ import app  # noqa: E402
 
 if __name__ == "__main__":
     try:
-        app.run(host="0.0.0.0", port=8787, open_browser=True)
+       app.run(
+    host="0.0.0.0",
+    port=int(os.environ.get("PORT", "8787")),
+    open_browser=False
+)
     except KeyboardInterrupt:
         pass
     print()

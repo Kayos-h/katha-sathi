@@ -156,6 +156,22 @@ const App = {
 
   async renderView() {
     const main = document.getElementById("main");
+    if (["add", "billmaker", "pay"].includes(this.current)) {
+      try {
+        const galla = await API.get("/api/galla");
+        if (!galla.open || galla.closed) {
+          toast(galla.closed
+            ? "Today's galla is closed. Start a fresh galla before recording more money."
+            : "Start today's galla first, then bills and payments stay connected.",
+            "warn", 5200);
+          this.current = "galla";
+          this.currentParams = {};
+          if (location.hash !== "#galla") location.hash = "#galla";
+        }
+      } catch (e) {
+        /* the view itself will show the real API error if the guard can't check */
+      }
+    }
     const v = this.views[this.current];
     document.getElementById("topbar-title").textContent = v.title;
     this.markNav();
@@ -199,7 +215,7 @@ const App = {
     const card = document.getElementById("auth-card");
     if (mode === "setup") {
       card.innerHTML =
-        '<div class="auth-logo">ब</div>' +
+        '<div class="auth-logo">K</div>' +
         '<div class="auth-title">Welcome to Khata Sathi</div>' +
         '<div class="auth-sub">Your bills, your khata — one place.<br>Set up the shop in 30 seconds.</div>' +
         '<div class="field"><label>Your name (the seller)</label><input class="input" id="su-name" placeholder="e.g. Durga"></div>' +
@@ -213,7 +229,7 @@ const App = {
     } else {
       const seller = (this.state && this.state.seller_name) ? this.state.seller_name : "seller";
       card.innerHTML =
-        '<div class="auth-logo">ब</div>' +
+        '<div class="auth-logo">K</div>' +
         '<div class="auth-kicker">Khata Sathi</div>' +
         '<div class="auth-title">Welcome, ' + escapeHtml(seller) + '</div>' +
         '<div class="auth-sub" id="lg-who">Enter your PIN</div>' +
@@ -349,7 +365,15 @@ const App = {
     this.paintChrome();
     this.connectLive();
     const hash = (location.hash || "").replace("#", "");
-    this.go(["dash", "people", "ledgerhub", "add", "billmaker", "galla", "activity", "settings"].includes(hash) ? hash : "dash");
+    let start = ["dash", "people", "ledgerhub", "add", "billmaker", "galla", "activity", "settings"].includes(hash) ? hash : "dash";
+    try {
+      const galla = await API.get("/api/galla");
+      if (!galla.open && start !== "galla") {
+        start = "galla";
+        toast("Start today's galla first so every bill and payment connects to the drawer.", "warn", 5200);
+      }
+    } catch (e) { /* keep requested start view */ }
+    this.go(start);
   },
 
   /* ---------- More sheet (phone) ---------- */

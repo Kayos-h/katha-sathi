@@ -46,13 +46,20 @@ const People = {
       this.apply(main);
     });
     main.querySelector("#p-grid").addEventListener("click", (e) => {
-      const card = e.target.closest("[data-person]");
-      if (card) App.go("ledger", { id: card.getAttribute("data-person") });
+      const full = e.target.closest("[data-pay-full]");
+      if (full) {
+        e.stopPropagation();
+        App.go("pay", { id: full.getAttribute("data-pay-full"), full: true });
+        return;
+      }
       const btn = e.target.closest("[data-pay]");
       if (btn) {
         e.stopPropagation();
         App.go("pay", { id: btn.getAttribute("data-pay") });
+        return;
       }
+      const card = e.target.closest("[data-person]");
+      if (card) App.go("ledger", { id: card.getAttribute("data-person") });
     });
     await this.load(main);
   },
@@ -103,9 +110,11 @@ const People = {
         '<div class="b-cap">' + (owing ? "owes" : "clear") + "</div>" +
         '<div class="b-main money ' + (owing ? "neg" : "pos") + '">' + fmtMoney(owing ? p.balance : 0) + "</div>" +
         "</div></div>" +
-        '<div class="p-meta"><span>' + ico("doc") + "lifetime रू " + fmtMoney(p.lifetime_billed) + "</span>" +
-        "<span>" + ico("money") + "paid रू " + fmtMoney(p.lifetime_paid) + "</span>" +
-        (owing ? '<button class="btn sm success" data-pay="' + p.id + '" style="margin-left:auto">' + ico("money") + "Got money</button>" : "") +
+        '<div class="p-meta"><span>' + ico("doc") + "lifetime " + fmtMoney(p.lifetime_billed) + "</span>" +
+        "<span>" + ico("money") + "paid " + fmtMoney(p.lifetime_paid) + "</span>" +
+        (owing ? '<div class="pay-actions">' +
+          '<button class="btn sm success" data-pay-full="' + p.id + '">' + ico("check") + "Full clear</button>" +
+          '<button class="btn sm" data-pay="' + p.id + '">' + ico("money") + "Pay little</button></div>" : "") +
         "</div>" +
         '<div class="p-sub" style="font-size:11px;color:var(--ink-3)">' + "added " + fmtDate(p.created_at) + last + "</div>" +
         "</div>";
@@ -184,12 +193,13 @@ const Ledger = {
     const owing = d.balance > 0.004;
 
     document.title = p.name + " · Khata Sathi";
-    main.querySelector("#lg-name").textContent = p.name + " — खाता";
+    main.querySelector("#lg-name").textContent = p.name + " — Khata";
     main.querySelector("#lg-sub").textContent =
       (p.phone ? p.phone + " · " : "") + "added " + fmtDate(p.created_at);
 
     main.querySelector("#lg-actions").innerHTML =
-      (owing ? '<button class="btn success" data-a="pay">' + ico("money") + "Got money</button>" : "") +
+      (owing ? '<button class="btn success" data-a="pay-full">' + ico("check") + "Full clear</button>" +
+        '<button class="btn" data-a="pay">' + ico("money") + "Pay little</button>" : "") +
       '<button class="btn primary" data-a="bill">' + ico("cam") + "Add bill</button>" +
       '<button class="btn" data-a="edit">' + ico("edit") + "</button>" +
       '<button class="btn" data-a="merge">' + ico("merge") + "</button>" +
@@ -201,6 +211,7 @@ const Ledger = {
       const b = e.target.closest("[data-a]");
       if (!b) return;
       const a = b.getAttribute("data-a");
+      if (a === "pay-full") App.go("pay", { id: p.id, full: true });
       if (a === "pay") App.go("pay", { id: p.id });
       if (a === "bill") App.go("add", { person: p.id });
       if (a === "edit") People.addPersonDialog({ id: p.id, name: p.name, phone: p.phone, notes: p.notes });
@@ -247,17 +258,18 @@ const Ledger = {
     if (!d.rows.length) {
       khata.innerHTML =
         '<div class="khata-paper"><div class="khata-head">' +
-        '<div class="khata-title">खाता <span class="dev">· ' + escapeHtml(p.name) + "</span></div>" +
+        '<div class="khata-title">Khata <span class="dev">· ' + escapeHtml(p.name) + "</span></div>" +
         '<div class="khata-sub">the account is empty — add the first bill</div></div>' +
         '<div class="khata-empty">Nothing written in this khata yet.</div></div>';
     } else {
       khata.innerHTML =
         '<div class="khata-paper" id="khata-paper">' +
         '<div class="khata-head">' +
-        '<div class="khata-title">खाता <span class="dev">— ' + escapeHtml(p.name) + "</span></div>" +
+        '<div class="khata-title">Khata <span class="dev">— ' + escapeHtml(p.name) + "</span></div>" +
         '<div class="khata-sub">' + escapeHtml(App.state.store_name || "Khata Sathi") + "</div>" +
         '<div class="khata-head-actions" style="margin-left:auto">' +
-        (owing ? '<button class="btn success sm" data-a="pay">' + ico("money") + "Got money</button>" : "") +
+        (owing ? '<button class="btn success sm" data-a="pay-full">' + ico("check") + "Full clear</button>" +
+        '<button class="btn sm" data-a="pay">' + ico("money") + "Pay little</button>" : "") +
         '<button class="btn primary sm" data-a="bill">' + ico("cam") + "Add bill</button>" +
         "</div></div>" +
         '<div class="khata-meta">' +
@@ -267,20 +279,20 @@ const Ledger = {
         "<span>Bills with photos: <b>" + d.rows.filter((r) => r.photo).length + "</b></span>" +
         "</div>" +
         '<table class="khata-table"><thead><tr>' +
-        '<th class="date-col">मिति<span class="hide-sm"> Date</span></th>' +
-        '<th class="part-col">विवरण Particulars</th>' +
-        '<th class="num">डेबिट Debit</th>' +
-        '<th class="num">क्रेडिट Credit</th>' +
-        '<th class="num">बाँकी Balance</th>' +
+        '<th class="date-col">Date</th>' +
+        '<th class="part-col">Particulars</th>' +
+        '<th class="num">Debit</th>' +
+        '<th class="num">Credit</th>' +
+        '<th class="num">Balance</th>' +
         "</tr></thead><tbody>" + bodyRows + "</tbody>" +
         '<tfoot><tr class="khata-totals">' +
-        '<td colspan="2" class="t-label">जम्मा Total</td>' +
+        '<td colspan="2" class="t-label">Total</td>' +
         '<td class="num k-dr">' + fmtMoney(totalDebit) + "</td>" +
         '<td class="num k-cr">' + fmtMoney(totalCredit) + "</td>" +
         '<td class="num">' + fmtMoney(d.balance) + "</td>" +
         "</tr></tfoot></table>" +
         '<div class="khata-grand">' +
-        '<span class="g-lbl">' + (owing ? "बाँकी बाँकी Balance owed</span>" : "सबै चुक्ता All clear</span>") +
+        '<span class="g-lbl">' + (owing ? "Balance owed</span>" : "All clear</span>") +
         '<span class="g-val money ' + (owing ? "neg" : "pos") + '">' + fmtMoney(d.balance) + "</span></div>" +
         "</div>";
     }
@@ -289,6 +301,15 @@ const Ledger = {
     khata.addEventListener("click", (e) => {
       const ph = e.target.closest("[data-photo]");
       if (ph) { e.stopPropagation(); lightbox("/photo/" + ph.getAttribute("data-photo")); return; }
+      const action = e.target.closest("[data-a]");
+      if (action) {
+        e.stopPropagation();
+        const a = action.getAttribute("data-a");
+        if (a === "pay-full") App.go("pay", { id: p.id, full: true });
+        if (a === "pay") App.go("pay", { id: p.id });
+        if (a === "bill") App.go("add", { person: p.id });
+        return;
+      }
       const row = e.target.closest("[data-row]");
       if (!row) return;
       if (row.getAttribute("data-kind") === "bill") this.billDialog(row.getAttribute("data-row"), p.id);
@@ -341,7 +362,7 @@ const Ledger = {
       /* the complete credit of this bill, khata-style */
       const creditBox =
         '<div class="pay-plan" style="margin-top:12px">' +
-        '<div class="pp-row pp-head">Complete credit — यो बिलको पूरा हिसाब</div>' +
+        '<div class="pp-row pp-head">Complete credit — the full story of this bill</div>' +
         '<div class="pp-row"><span class="pp-date">Bill amount</span><span class="pp-amount">the full credit given</span>' +
         '<span style="font-weight:800">' + fmtMoney(b.amount) + "</span></div>" +
         (paidTotal > 0.004
@@ -350,7 +371,7 @@ const Ledger = {
             '<span class="pp-apply">−' + fmtMoney(paidTotal) + "</span></div>"
           : "") +
         (b.already_paid
-          ? '<div class="pp-row" style="background:var(--green-soft)"><span class="pp-date">Paid at counter</span><span class="pp-amount">no credit was owed</span><span class="pp-apply">रू 0</span></div>'
+          ? '<div class="pp-row" style="background:var(--green-soft)"><span class="pp-date">Paid at counter</span><span class="pp-amount">no credit was owed</span><span class="pp-apply">Rs. 0</span></div>'
           : '<div class="pp-row" style="background:' + (b.remaining > 0.004 ? "var(--amber-soft)" : "var(--green-soft)") + '">' +
             '<span class="pp-date">' + (b.remaining > 0.004 ? "Still open" : "Fully cleared") + "</span>" +
             '<span class="pp-amount">remaining on this bill</span>' +

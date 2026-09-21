@@ -135,8 +135,11 @@ const AddBill = {
       '<div class="sug-pop hidden" id="ab-sug"></div>' +
       "</div>" +
       '<div class="field" style="margin-top:14px"><label>Amount on the bill</label>' +
-      '<input class="input big money" id="ab-amt" placeholder="रू 0" inputmode="text" autocomplete="off">' +
-      '<div class="hint">Devanagari digits (१२३) and commas are fine — they convert as you type.</div></div>' +
+      '<input class="input big money" id="ab-amt" placeholder="Rs. 0" inputmode="text" autocomplete="off">' +
+      '<div class="hint">Commas are fine — Nepali digits convert to English as you type.</div></div>' +
+      '<div class="field" style="margin-top:14px"><label>Paid now (optional)</label>' +
+      '<input class="input money" id="ab-paid-now" placeholder="Rs. 0" inputmode="text" autocomplete="off">' +
+      '<div class="hint" id="ab-paid-hint">Leave empty for full credit, or enter the amount paid now.</div></div>' +
       '<div class="field" style="margin-top:14px"><label>Note (optional)</label>' +
       '<input class="input" id="ab-note" placeholder="e.g. groceries, 3 tins oil"></div>' +
       '<div class="check-row" style="margin-top:16px">' +
@@ -155,11 +158,37 @@ const AddBill = {
 
     /* Devanagari live conversion on amount */
     const amt = el.querySelector("#ab-amt");
+    const paidNow = el.querySelector("#ab-paid-now");
+    const paidToggle = el.querySelector("#ab-paid");
+    const paintPaid = () => {
+      const total = toAmountFloat(amt.value) || 0;
+      if (paidToggle.checked) {
+        paidNow.value = "";
+        paidNow.disabled = true;
+        el.querySelector("#ab-paid-hint").textContent = "Full amount is marked paid at the counter.";
+        return;
+      }
+      paidNow.disabled = false;
+      const paid = toAmountFloat(paidNow.value) || 0;
+      el.querySelector("#ab-paid-hint").textContent = paid > 0
+        ? fmtMoney(paid) + " will be recorded as paid; " + fmtMoney(Math.max(0, total - paid)) + " stays in the khata."
+        : "Leave empty for full credit, or enter the amount paid now.";
+    };
     amt.addEventListener("input", () => {
       const raw = amt.value;
       const conv = devToAscii(raw);
       if (conv !== raw) amt.value = conv;
+      paintPaid();
     });
+    paidNow.addEventListener("input", () => {
+      const raw = paidNow.value;
+      const conv = devToAscii(raw).replace(/रू|rs\.?|npr/gi, "").replace(/[^\d.]/g, "");
+      const first = conv.indexOf(".");
+      const cleaned = first === -1 ? conv : conv.slice(0, first + 1) + conv.slice(first + 1).replace(/\./g, "");
+      if (cleaned !== raw) paidNow.value = cleaned;
+      paintPaid();
+    });
+    paidToggle.addEventListener("change", paintPaid);
 
     /* name suggestions */
     const nameEl = el.querySelector("#ab-name");
@@ -212,10 +241,15 @@ const AddBill = {
     const amtRaw = main.querySelector("#ab-amt").value;
     const note = main.querySelector("#ab-note").value.trim();
     const alreadyPaid = main.querySelector("#ab-paid").checked;
+    const paidRaw = main.querySelector("#ab-paid-now").value.trim();
     const amount = toAmountFloat(amtRaw);
+    const paidNow = paidRaw ? toAmountFloat(paidRaw) : 0;
 
     if (!name) { toast("Type who the bill is for", "err"); main.querySelector("#ab-name").focus(); return; }
     if (amount === null || amount <= 0) { toast("Enter the bill amount", "err"); main.querySelector("#ab-amt").focus(); return; }
+    if (paidNow === null || paidNow < 0) { toast("Enter a valid paid amount", "err"); return; }
+    if (alreadyPaid && paidNow > 0) { toast("Use either already paid or paid now, not both", "err"); return; }
+    if (paidNow > amount + 0.004) { toast("Paid amount cannot be more than the bill total", "err"); return; }
 
     /* the law: bad photo never saves silently */
     if (this.quality && this.quality.ok === false && !this.quality.forced) {
@@ -230,13 +264,19 @@ const AddBill = {
       amount: amtRaw,
       note: note,
       already_paid: alreadyPaid,
+      paid_amount: paidNow > 0 ? paidNow : undefined,
+      paid_note: paidNow > 0 ? "paid while adding bill" : undefined,
     };
 
     /* attach photo if we have one */
     const finish = (photoB64) => {
       if (photoB64) payload.photo_b64 = photoB64;
       API.post("/api/bills/add", payload).then((res) => {
-        toast(alreadyPaid ? "Bill saved (paid at counter)" : "Bill saved — " + fmtMoney(amount) + (photoB64 ? " · received on laptop ✓" : ""), "ok");
+        let msg = alreadyPaid ? "Bill saved (paid at counter)" : "Bill saved — " + fmtMoney(amount);
+        if (paidNow > 0) msg += " · " + fmtMoney(paidNow) + " paid, " + fmtMoney(res.remaining) + " left";
+        if ((alreadyPaid || paidNow > 0) && res.galla_in) msg += " · cash added to galla";
+        if (photoB64) msg += " · received on laptop ✓";
+        toast(msg, "ok");
         App.go("ledger", { id: res.person_id });
       }).catch((e) => toast(e.message, "err"));
     };

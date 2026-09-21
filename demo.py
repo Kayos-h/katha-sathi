@@ -26,7 +26,7 @@ PEOPLE = [
     ("Gita Adhikari", "9841000004", ""),
     ("Bikash Tamang", "", ""),
     ("Kanchha Kaka", "", "Old friend, never in a hurry"),
-    ("नेपाली नाम", "9841000007", "Devanagari name test"),
+    ("Nepali Name", "9841000007", "Devanagari name test"),
     ("Anisha Rai", "9841000008", "Always clears in 3 days"),
 ]
 
@@ -74,7 +74,8 @@ def load_demo():
             if data:
                 fname = photos.save_photo(data, ".jpg")
                 photo = fname
-        db.create_bill(pid, amount, photo=photo, already_paid=already, created_at=when)
+        db.create_bill(pid, amount, photo=photo, already_paid=already,
+                       created_at=when, require_galla=False)
 
     # payments: each clears some of the older open bills
     for pid, name in made_people:
@@ -86,7 +87,8 @@ def load_demo():
             amt = round(total * part, 2)
             if amt > 0:
                 when = (now - timedelta(days=random.randint(0, 12))).strftime("%Y-%m-%dT%H:%M:%S")
-                db.record_payment(pid, amt, note="demo payment", created_at=when)
+                db.record_payment(pid, amt, note="demo payment", created_at=when,
+                                  require_galla=False)
 
     db.set_setting("store_name", "Khata Sathi Demo Store")
     return {"people": len(made_people)}

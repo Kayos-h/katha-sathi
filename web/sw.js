@@ -3,7 +3,7 @@
    JavaScript (stale-code bugs look like magic). The cache is only the
    offline fallback. New version deploys -> skipWaiting + clients.claim ->
    app.js hears "controllerchange" and reloads the page once. */
-const CACHE = "khatasathi-shell-v9";
+const CACHE = "khatasathi-shell-v12";
 const SHELL = ["/", "/style.css", "/util.js", "/api.js", "/manifest.json", "/favicon.svg",
   "/views/dashboard.js", "/views/people.js", "/views/bill.js", "/views/billmaker.js", "/views/ledger.js",
   "/views/galla.js", "/views/payment.js", "/views/activity.js", "/views/settings.js",
