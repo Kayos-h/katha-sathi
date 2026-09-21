@@ -341,7 +341,8 @@ class Handler(BaseHTTPRequestHandler):
         ctype = EXT_TYPES.get(ext, "application/octet-stream")
         with open(path, "rb") as fh:
             body = fh.read()
-        self._send(200, body, ctype)
+        cache_header = "no-cache" if fname == "index.html" else "public, max-age=3600, stale-while-revalidate=86400"
+        self._send(200, body, ctype, extra=[("Cache-Control", cache_header)])
 
     def _api_state(self):
         user = self._get_auth_user()
@@ -354,8 +355,9 @@ class Handler(BaseHTTPRequestHandler):
                 "store_name": "",
             })
         uid = user["user_id"]
-        seller = db.get_setting("seller_name", user.get("seller_name") or "", user_id=uid)
-        store = db.get_setting("store_name", "", user_id=uid)
+        settings = db.get_settings_dict(user_id=uid)
+        seller = settings.get("seller_name") or user.get("seller_name") or ""
+        store = settings.get("store_name") or ""
         return self._json(200, {
             "has_account": True,
             "authenticated": True,
@@ -460,9 +462,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._api_bill_pdf(params, uid)
             if path == "/api/galla":
                 return self._json(200, db.galla_summary(params.get("date"), user_id=uid))
-            if path == "/api/galla/recent":
-                return self._json(200, {"days": db.galla_recent(
-                    int(params.get("days") or 7), user_id=uid)})
+            if path in ("/api/galla/recent", "/api/galla/history"):
+                days = int(params.get("days") or 30)
+                return self._json(200, {"days": db.galla_recent(days, user_id=uid)})
             if path == "/api/galla/pdf":
                 return self._api_galla_pdf(params, uid)
             if path == "/api/bill":

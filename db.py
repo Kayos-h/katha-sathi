@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 try:
     import psycopg2
     import psycopg2.extras
+    import psycopg2.pool
     HAS_PSYCOPG2 = True
 except ImportError:
     HAS_PSYCOPG2 = False
@@ -202,22 +203,95 @@ class SQLiteConnWrapper:
         pass
 
 
+_pg_pool = None
+
+def _get_pg_pool():
+    global _pg_pool
+    if _pg_pool is None:
+        db_url = get_database_url()
+        if db_url and (db_url.startswith("postgresql://") or db_url.startswith("postgres://")):
+            if not HAS_PSYCOPG2:
+                raise ImportError("psycopg2-binary is required for PostgreSQL connections.")
+            if "sslmode=" not in db_url and "localhost" not in db_url and "127.0.0.1" not in db_url:
+                sep = "&" if "?" in db_url else "?"
+                db_url = f"{db_url}{sep}sslmode=require"
+            _pg_pool = psycopg2.pool.ThreadedConnectionPool(
+                minconn=1,
+                maxconn=10,
+                dsn=db_url,
+                cursor_factory=psycopg2.extras.RealDictCursor,
+                connect_timeout=10,
+            )
+    return _pg_pool
+
+
+class PooledPGConnWrapper:
+    def __init__(self, pool, conn):
+        self._pool = pool
+        self._conn = conn
+        self._closed = False
+
+    def cursor(self):
+        return self._conn.cursor()
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            if self._pool is not None:
+                try:
+                    self._pool.putconn(self._conn)
+                except Exception:
+                    pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type:
+            self.rollback()
+        else:
+            self.commit()
+        self.close()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
 def connect():
-    """Returns a PostgreSQL connection in production, or in-memory SQLite during local offline testing."""
+    """Returns a pooled PostgreSQL connection in production, or in-memory SQLite during local offline testing."""
     db_url = get_database_url()
     if db_url and (db_url.startswith("postgresql://") or db_url.startswith("postgres://")):
-        if not HAS_PSYCOPG2:
-            raise ImportError("psycopg2-binary is required for PostgreSQL connections.")
-        if "sslmode=" not in db_url and "localhost" not in db_url and "127.0.0.1" not in db_url:
-            sep = "&" if "?" in db_url else "?"
-            db_url = f"{db_url}{sep}sslmode=require"
-        conn = psycopg2.connect(
-            db_url,
-            cursor_factory=psycopg2.extras.RealDictCursor,
-            connect_timeout=10,
-        )
-        conn.autocommit = False
-        return conn
+        try:
+            pool = _get_pg_pool()
+            raw_conn = pool.getconn()
+            if raw_conn.closed:
+                pool.putconn(raw_conn, close=True)
+                raw_conn = pool.getconn()
+            raw_conn.autocommit = False
+            return PooledPGConnWrapper(pool, raw_conn)
+        except Exception:
+            if not HAS_PSYCOPG2:
+                raise ImportError("psycopg2-binary is required for PostgreSQL connections.")
+            if "sslmode=" not in db_url and "localhost" not in db_url and "127.0.0.1" not in db_url:
+                sep = "&" if "?" in db_url else "?"
+                db_url = f"{db_url}{sep}sslmode=require"
+            raw_conn = psycopg2.connect(
+                db_url,
+                cursor_factory=psycopg2.extras.RealDictCursor,
+                connect_timeout=10,
+            )
+            raw_conn.autocommit = False
+            return raw_conn
 
     # If running on Vercel or production and DATABASE_URL is missing, fail clearly with zero disk writes
     if os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV") or os.environ.get("KHATASATHI_PROD"):
@@ -277,6 +351,15 @@ def get_setting(key, default=None, user_id="default"):
         row = cur.fetchone()
     conn.close()
     return row["value"] if row is not None else default
+
+
+def get_settings_dict(user_id="default"):
+    conn = connect()
+    with conn.cursor() as cur:
+        cur.execute("SELECT key, value FROM settings WHERE user_id = %s", (user_id,))
+        rows = cur.fetchall()
+    conn.close()
+    return {r["key"]: r["value"] for r in rows}
 
 
 def set_setting(key, value, user_id="default"):
@@ -1339,30 +1422,37 @@ def day_summary(date=None, user_id="default"):
 def dashboard(user_id="default"):
     conn = connect()
     today = datetime.now().strftime("%Y-%m-%d")
+    start_date = (datetime.now() - timedelta(days=29)).strftime("%Y-%m-%d")
+
     with conn.cursor() as cur:
         cur.execute(
             "SELECT COALESCE(SUM(remaining),0) as s FROM bills WHERE user_id = %s AND status = 'open'",
             (user_id,)
         )
         open_total = cur.fetchone()["s"]
+
         cur.execute(
             "SELECT COUNT(DISTINCT person_id) as c FROM bills"
             " WHERE user_id = %s AND status = 'open' AND remaining > 0.004",
             (user_id,)
         )
         people_open = cur.fetchone()["c"]
+
         cur.execute("SELECT COUNT(*) as c FROM people WHERE user_id = %s", (user_id,))
         total_people = cur.fetchone()["c"]
+
         cur.execute(
             "SELECT COUNT(*) as c FROM bills WHERE user_id = %s AND status = 'open' AND remaining > 0.004",
             (user_id,)
         )
         open_count = cur.fetchone()["c"]
+
         cur.execute(
             "SELECT created_at, remaining FROM bills WHERE user_id = %s AND status = 'open' AND remaining > 0.004",
             (user_id,)
         )
         aging_rows = cur.fetchall()
+
         cur.execute(
             "SELECT p.id, p.name, COALESCE(SUM(b.remaining),0) AS bal, COUNT(*) AS n"
             " FROM bills b JOIN people p ON p.id=b.person_id AND p.user_id=b.user_id"
@@ -1372,13 +1462,51 @@ def dashboard(user_id="default"):
         )
         top = cur.fetchall()
 
+        cur.execute(
+            "SELECT SUBSTRING(created_at, 1, 10) as dt, "
+            "COALESCE(SUM(amount), 0) as billed, "
+            "COALESCE(SUM(CASE WHEN already_paid = 1 THEN amount ELSE 0 END), 0) as counter_paid, "
+            "COUNT(*) as n_bills, "
+            "COALESCE(SUM(CASE WHEN already_paid = 0 THEN 1 ELSE 0 END), 0) as n_bills_credit "
+            "FROM bills WHERE user_id = %s AND status != 'void' AND SUBSTRING(created_at, 1, 10) >= %s "
+            "GROUP BY SUBSTRING(created_at, 1, 10)",
+            (user_id, start_date)
+        )
+        bill_days = {r["dt"]: r for r in cur.fetchall()}
+
+        cur.execute(
+            "SELECT SUBSTRING(created_at, 1, 10) as dt, "
+            "COALESCE(SUM(amount), 0) as collected, "
+            "COUNT(*) as n_pmts "
+            "FROM payments WHERE user_id = %s AND SUBSTRING(created_at, 1, 10) >= %s "
+            "GROUP BY SUBSTRING(created_at, 1, 10)",
+            (user_id, start_date)
+        )
+        pmt_days = {r["dt"]: r for r in cur.fetchall()}
+
+    conn.close()
+
     chart = []
     for i in range(29, -1, -1):
         d = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
-        t = _day_totals(conn, d, user_id=user_id)
-        chart.append({"date": d, "billed": t["billed"], "collected": t["collected"]})
+        bd = bill_days.get(d, {})
+        pd = pmt_days.get(d, {})
+        b_amt = f2(bd.get("billed", 0))
+        c_amt = f2(pd.get("collected", 0) + bd.get("counter_paid", 0))
+        chart.append({"date": d, "billed": b_amt, "collected": c_amt})
 
-    conn.close()
+    t_bd = bill_days.get(today, {})
+    t_pd = pmt_days.get(today, {})
+    today_summary = {
+        "date": today,
+        "billed": f2(t_bd.get("billed", 0)),
+        "collected": f2(t_pd.get("collected", 0) + t_bd.get("counter_paid", 0)),
+        "collected_payments": f2(t_pd.get("collected", 0)),
+        "collected_counter": f2(t_bd.get("counter_paid", 0)),
+        "n_bills": int(t_bd.get("n_bills", 0)),
+        "n_bills_credit": int(t_bd.get("n_bills_credit", 0)),
+        "n_payments": int(t_pd.get("n_pmts", 0)),
+    }
 
     buckets = {"0-7": 0.0, "8-15": 0.0, "16-30": 0.0, "31-60": 0.0, "60+": 0.0}
     now_t = time.time()
@@ -1405,7 +1533,7 @@ def dashboard(user_id="default"):
         "people_open": people_open,
         "total_people": total_people,
         "open_count": open_count,
-        "today": day_summary(today, user_id=user_id),
+        "today": today_summary,
         "chart": chart,
         "aging": buckets,
         "top_debtors": [
@@ -1637,23 +1765,48 @@ def galla_summary(date=None, user_id="default"):
     }
 
 
-def galla_recent(days=7, user_id="default"):
+def galla_recent(days=30, user_id="default"):
     conn = connect()
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT date, opening, closing FROM galla_days WHERE user_id = %s"
-            " ORDER BY date DESC LIMIT %s",
+            """
+            SELECT 
+                d.date, d.opening, d.closing, d.closed_at, d.note,
+                COALESCE(SUM(CASE WHEN e.direction = 'in' THEN e.amount ELSE 0 END), 0) AS cash_in,
+                COALESCE(SUM(CASE WHEN e.direction = 'out' THEN e.amount ELSE 0 END), 0) AS cash_out,
+                COUNT(e.id) AS entry_count
+            FROM galla_days d
+            LEFT JOIN galla_entries e ON e.user_id = d.user_id AND e.date = d.date
+            WHERE d.user_id = %s
+            GROUP BY d.date, d.opening, d.closing, d.closed_at, d.note
+            ORDER BY d.date DESC
+            LIMIT %s
+            """,
             (user_id, int(days)),
         )
         rows = cur.fetchall()
     conn.close()
     out = []
     for r in rows:
-        s = galla_summary(r["date"], user_id=user_id)
-        out.append({"date": s["date"], "opening": s["opening"],
-                    "cash_in": s["cash_in"], "cash_out": s["cash_out"],
-                    "expected": s["expected"], "closing": s["closing"],
-                    "difference": s["difference"]})
+        opening = f2(r["opening"])
+        cash_in = f2(r["cash_in"])
+        cash_out = f2(r["cash_out"])
+        expected = f2(opening + cash_in - cash_out)
+        closing = None if r["closing"] is None else f2(r["closing"])
+        diff = None if closing is None else f2(closing - expected)
+        out.append({
+            "date": r["date"],
+            "opening": opening,
+            "cash_in": cash_in,
+            "cash_out": cash_out,
+            "expected": expected,
+            "closing": closing,
+            "difference": diff,
+            "closed": r["closing"] is not None,
+            "closed_at": r["closed_at"] or "",
+            "note": r["note"] or "",
+            "entry_count": r.get("entry_count", 0),
+        })
     return out
 
 

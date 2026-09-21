@@ -217,7 +217,13 @@ const Payment = {
         toast("Payment saved" + (res.galla_in ? " — cash added to galla" : "") +
           (clearedTxt ? " — " + clearedTxt : ""), "ok", 3800);
         App.go("ledger", { id: this.person.id });
-      }).catch((e) => toast(e.message, "err"));
+      }).catch((e) => {
+        if (e.message && e.message.includes("Open today's galla")) {
+          promptOpenGalla(() => finish(b64));
+        } else {
+          toast(e.message, "err");
+        }
+      });
     };
 
     if (this.photoBytes) {

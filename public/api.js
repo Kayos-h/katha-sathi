@@ -29,7 +29,11 @@ const API = {
   },
 
   get(path) { return this.req("GET", path); },
-  post(path, body) { return this.req("POST", path, body); },
+  async post(path, body) {
+    const res = await this.req("POST", path, body);
+    setTimeout(() => { if (typeof Live !== "undefined" && Live.pollNow) Live.pollNow(); }, 150);
+    return res;
+  },
   postRaw(path, bytes, ctype) { return this.req("POST", path, undefined, bytes, ctype); },
 
   saveToken(t) {
@@ -81,12 +85,12 @@ const Live = {
     if (!API.token) return;
     // Initial sync fetch
     this.pollNow();
-    // Periodic background sync (every 3.5s)
+    // Adaptive background sync (every 10s when active)
     this.timer = setInterval(() => {
       if (!document.hidden) {
         this.pollNow();
       }
-    }, 3500);
+    }, 10000);
 
     // Instant sync when user switches back to the tab/app
     this._onVisibility = () => {

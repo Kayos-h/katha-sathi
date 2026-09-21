@@ -300,7 +300,13 @@ const BillMaker = {
         if (paidNow > 0) msg += " · " + fmtMoney(paidNow) + " paid, " + fmtMoney(res.remaining) + " left";
         toast(msg, "ok", 4200);
         this.shareDialog(res, name);
-      }).catch((e) => toast(e.message, "err"));
+      }).catch((e) => {
+        if (e.message && e.message.includes("Open today's galla")) {
+          promptOpenGalla(() => finish(photoB64));
+        } else {
+          toast(e.message, "err");
+        }
+      });
     };
 
     if (this.photoFile) {

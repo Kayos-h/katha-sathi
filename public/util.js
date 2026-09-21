@@ -274,3 +274,44 @@ function name_of(text) {
   const m = text.match(/for ([^\n·]+)/i);
   return m ? m[1].trim() : "Bill PDF";
 }
+
+function promptOpenGalla(onSuccess) {
+  const body = document.createElement("div");
+  body.innerHTML =
+    '<div style="font-size:14px;color:var(--ink-2);margin-bottom:12px">' +
+    "Today's galla is not started yet. Enter the morning cash float to proceed with this transaction.</div>" +
+    '<div class="field"><label>Morning starting cash</label>' +
+    '<input class="input big money" id="modal-galla-amt" placeholder="Rs. 0" inputmode="text"></div>' +
+    '<div class="field" style="margin-top:12px"><label>Note (optional)</label>' +
+    '<input class="input" id="modal-galla-note" placeholder="e.g. morning float"></div>';
+  modal({
+    title: "Open Today's Galla",
+    body,
+    buttons: [
+      { label: "Cancel", cls: "ghost" },
+      {
+        label: "Open & Continue",
+        cls: "primary",
+        onClick: async () => {
+          const amt = body.querySelector("#modal-galla-amt").value;
+          const v = toAmountFloat(amt);
+          if (v === null || v < 0) { toast("Enter today's starting cash", "err"); return; }
+          try {
+            await API.post("/api/galla/open", {
+              opening: amt,
+              note: body.querySelector("#modal-galla-note").value.trim(),
+            });
+            toast("Galla opened — " + fmtMoney(v), "ok");
+            if (onSuccess) onSuccess();
+          } catch (e) {
+            toast(e.message, "err");
+          }
+        },
+      },
+    ],
+  });
+  setTimeout(() => {
+    const input = body.querySelector("#modal-galla-amt");
+    if (input) input.focus();
+  }, 60);
+}
