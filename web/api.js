@@ -18,7 +18,7 @@ const API = {
     const resp = await fetch(path, { method, headers, body: payload });
     let data = {};
     try { data = await resp.json(); } catch (e) { /* non-json */ }
-    if (resp.status === 401 && path !== "/api/login") {
+    if (resp.status === 401 && !path.startsWith("/api/auth/") && path !== "/api/login") {
       this.token = "";
       localStorage.removeItem("bs_token");
       window.dispatchEvent(new CustomEvent("bs-auth-expired"));

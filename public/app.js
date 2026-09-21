@@ -37,15 +37,19 @@ const App = {
 
   handleOAuthCallback() {
     const hash = window.location.hash || "";
+    const search = window.location.search || "";
+    let accessToken = null;
     if (hash.includes("access_token=")) {
       const params = new URLSearchParams(hash.replace(/^#/, ""));
-      const accessToken = params.get("access_token");
-      if (accessToken) {
-        API.saveToken(accessToken);
-        // Clean URL hash without triggering navigation
-        if (window.history && window.history.replaceState) {
-          window.history.replaceState(null, "", window.location.pathname);
-        }
+      accessToken = params.get("access_token");
+    } else if (search.includes("access_token=")) {
+      const params = new URLSearchParams(search);
+      accessToken = params.get("access_token");
+    }
+    if (accessToken) {
+      API.saveToken(accessToken);
+      if (window.history && window.history.replaceState) {
+        window.history.replaceState(null, "", window.location.pathname);
       }
     }
   },
@@ -177,29 +181,13 @@ const App = {
 
   async renderView() {
     const main = document.getElementById("main");
-    if (["add", "billmaker", "pay"].includes(this.current)) {
-      try {
-        const galla = await API.get("/api/galla");
-        if (!galla.open || galla.closed) {
-          toast(galla.closed
-            ? "Today's galla is closed. Start a fresh galla before recording more money."
-            : "Start today's galla first, then bills and payments stay connected.",
-            "warn", 5200);
-          this.current = "galla";
-          this.currentParams = {};
-          if (location.hash !== "#galla") location.hash = "#galla";
-        }
-      } catch (e) {
-        /* silent */
-      }
-    }
     const v = this.views[this.current];
-    document.getElementById("topbar-title").textContent = v.title;
+    document.getElementById("topbar-title").textContent = v ? v.title : "Khata Sathi";
     this.markNav();
     document.getElementById("btn-back").style.display = ["ledger", "pay"].includes(this.current) ? "" : "none";
     main.scrollTop = 0;
     try {
-      await v.render(main, this.currentParams);
+      if (v) await v.render(main, this.currentParams);
     } catch (e) {
       main.innerHTML = '<div class="panel empty"><div class="e-ico">' + ico("warn") + '</div><div class="e-t">' + escapeHtml(e.message) + "</div></div>";
     }
@@ -388,14 +376,7 @@ const App = {
     this.paintChrome();
     this.connectLive();
     const hash = (location.hash || "").replace("#", "");
-    let start = ["dash", "people", "ledgerhub", "add", "billmaker", "galla", "activity", "settings"].includes(hash) ? hash : "dash";
-    try {
-      const galla = await API.get("/api/galla");
-      if (!galla.open && start !== "galla") {
-        start = "galla";
-        toast("Start today's galla first so every bill and payment connects to the drawer.", "warn", 5200);
-      }
-    } catch (e) { /* keep requested start view */ }
+    const start = ["dash", "people", "ledgerhub", "add", "billmaker", "galla", "activity", "settings"].includes(hash) ? hash : "dash";
     this.go(start);
   },
 

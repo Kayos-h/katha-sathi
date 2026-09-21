@@ -235,10 +235,16 @@ class PooledPGConnWrapper:
         return self._conn.cursor()
 
     def commit(self):
-        self._conn.commit()
+        try:
+            self._conn.commit()
+        except Exception:
+            pass
 
     def rollback(self):
-        self._conn.rollback()
+        try:
+            self._conn.rollback()
+        except Exception:
+            pass
 
     def close(self):
         if not self._closed:
@@ -247,11 +253,22 @@ class PooledPGConnWrapper:
                 self._conn.rollback()
             except Exception:
                 pass
-            if self._pool is not None:
+            if self._pool is not None and not getattr(self._conn, "closed", 1):
                 try:
                     self._pool.putconn(self._conn)
                 except Exception:
                     pass
+            elif self._conn and not getattr(self._conn, "closed", 1):
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __enter__(self):
         return self
@@ -274,8 +291,11 @@ def connect():
         try:
             pool = _get_pg_pool()
             raw_conn = pool.getconn()
-            if raw_conn.closed:
-                pool.putconn(raw_conn, close=True)
+            if getattr(raw_conn, "closed", 0) != 0:
+                try:
+                    pool.putconn(raw_conn, close=True)
+                except Exception:
+                    pass
                 raw_conn = pool.getconn()
             raw_conn.autocommit = False
             return PooledPGConnWrapper(pool, raw_conn)
@@ -291,7 +311,7 @@ def connect():
                 connect_timeout=10,
             )
             raw_conn.autocommit = False
-            return raw_conn
+            return PooledPGConnWrapper(None, raw_conn)
 
     # If running on Vercel or production and DATABASE_URL is missing, fail clearly with zero disk writes
     if os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV") or os.environ.get("KHATASATHI_PROD"):

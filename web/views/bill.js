@@ -170,12 +170,21 @@ const AddBill = {
       paid_note: paidNow > 0 ? "paid while adding bill" : undefined,
     };
 
-    API.post("/api/bills/add", payload).then((res) => {
-      let msg = alreadyPaid ? "Bill saved (paid at counter)" : "Bill saved — " + fmtMoney(amount);
-      if (paidNow > 0) msg += " · " + fmtMoney(paidNow) + " paid, " + fmtMoney(res.remaining) + " left";
-      if ((alreadyPaid || paidNow > 0) && res.galla_in) msg += " · cash added to galla";
-      toast(msg, "ok");
-      App.go("ledger", { id: res.person_id });
-    }).catch((e) => toast(e.message, "err"));
+    const doSave = () => {
+      API.post("/api/bills/add", payload).then((res) => {
+        let msg = alreadyPaid ? "Bill saved (paid at counter)" : "Bill saved — " + fmtMoney(amount);
+        if (paidNow > 0) msg += " · " + fmtMoney(paidNow) + " paid, " + fmtMoney(res.remaining) + " left";
+        if ((alreadyPaid || paidNow > 0) && res.galla_in) msg += " · cash added to galla";
+        toast(msg, "ok");
+        App.go("ledger", { id: res.person_id });
+      }).catch((e) => {
+        if (e.message && e.message.includes("Open today's galla")) {
+          promptOpenGalla(doSave);
+        } else {
+          toast(e.message, "err");
+        }
+      });
+    };
+    doSave();
   },
 };
