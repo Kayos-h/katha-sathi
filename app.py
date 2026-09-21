@@ -27,7 +27,7 @@ import photos
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(APP_DIR, "web")
 
-SESSION_SECRET = os.environ.get("SESSION_SECRET", "khatasathi-cloud-secret-key-2083")
+SESSION_SECRET = os.environ.get("SESSION_SECRET", "khatasathi-cloud-secret-key-2083").strip().lstrip("\ufeff")
 SESSION_TTL = 60 * 60 * 24 * 7  # 7 days
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().lstrip("\ufeff").rstrip("/")
@@ -222,15 +222,28 @@ class Handler(BaseHTTPRequestHandler):
     def _err(self, code, msg):
         self._json(code, {"error": msg})
 
+    def _header(self, key):
+        if not hasattr(self, "headers") or not self.headers:
+            return ""
+        key_lower = key.lower()
+        if hasattr(self.headers, "items"):
+            for k, v in self.headers.items():
+                if str(k).lower() == key_lower:
+                    return str(v)
+        try:
+            return str(self.headers.get(key) or "")
+        except Exception:
+            return ""
+
     def _is_secure(self):
-        proto = self.headers.get("X-Forwarded-Proto", "").lower()
+        proto = self._header("X-Forwarded-Proto").lower()
         return proto == "https"
 
     def _token(self):
-        auth = self.headers.get("Authorization") or ""
+        auth = self._header("Authorization")
         if auth.startswith("Bearer "):
             return auth[7:].strip()
-        cookie = self.headers.get("Cookie") or ""
+        cookie = self._header("Cookie")
         for part in cookie.split(";"):
             if part.strip().startswith("bs_session="):
                 return part.strip().split("=", 1)[1]
@@ -252,7 +265,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._get_auth_user() is not None
 
     def _app_url(self):
-        host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host") or "localhost"
+        host = self._header("X-Forwarded-Host") or self._header("Host") or "localhost"
         proto = "https" if self._is_secure() or "vercel.app" in host else "http"
         return f"{proto}://{host}"
 
