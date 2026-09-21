@@ -19,6 +19,7 @@ from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 
 import db
+import photos
 
 # ---------- shared money/date formatting (plain, ASCII for pdf) ----------
 
@@ -39,10 +40,13 @@ def _date_plain(iso):
 
 
 def _pick_font(size, bold=False):
-    """Segoe UI for Latin; Nirmala for any Devanagari that slips through."""
+    """Segoe UI for Latin; Nirmala for Devanagari; standard fonts for Linux/Vercel."""
     candidates = [
         r"C:\Windows\Fonts\segoeuib.ttf" if bold else r"C:\Windows\Fonts\segoeui.ttf",
         r"C:\Windows\Fonts\arialbd.ttf" if bold else r"C:\Windows\Fonts\arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf" if bold else "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
     ]
     for path in candidates:
         if os.path.exists(path):
@@ -50,16 +54,25 @@ def _pick_font(size, bold=False):
                 return ImageFont.truetype(path, size)
             except OSError:
                 continue
-    return ImageFont.load_default()
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
 
 
 def _pick_dev_font(size):
-    path = r"C:\Windows\Fonts\Nirmala.ttc"
-    if os.path.exists(path):
-        try:
-            return ImageFont.truetype(path, size)
-        except OSError:
-            pass
+    candidates = [
+        r"C:\Windows\Fonts\Nirmala.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+        "/usr/share/fonts/truetype/lohit-devanagari/Lohit-Devanagari.ttf",
+        "/usr/share/fonts/truetype/samyak/Samyak-Devanagari.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except OSError:
+                pass
     return _pick_font(size, True)
 
 
@@ -286,11 +299,14 @@ def khata_pdf(data, store_name=""):
         d.text((MARGIN, y), "Bill photos - " + p["name"], font=_pick_font(26, True), fill=INK)
         y += 50
         for (r,) in pair:
-            path = db.PHOTO_DIR + os.sep + r["photo"]
+            photo_name = r.get("photo")
             try:
-                if not os.path.exists(path):
+                if not photo_name:
                     raise FileNotFoundError
-                ph = Image.open(path)
+                ph_bytes, _ = photos.serve_photo(photo_name)
+                if not ph_bytes:
+                    raise FileNotFoundError
+                ph = Image.open(io.BytesIO(ph_bytes))
                 ph.load()
                 ph = ph.convert("RGB")
                 # fit in a box 520x600
@@ -443,11 +459,11 @@ def bill_pdf(bill, person, store_name=""):
     pages = [(img, "page")]
     photo_name = (bill.get("photo") or "").strip()
     if photo_name:
-        path = db.PHOTO_DIR + os.sep + photo_name
         try:
-            if not os.path.exists(path):
+            ph_bytes, _ = photos.serve_photo(photo_name)
+            if not ph_bytes:
                 raise FileNotFoundError
-            ph = Image.open(path)
+            ph = Image.open(io.BytesIO(ph_bytes))
             ph.load()
             ph = ph.convert("RGB")
             max_w, max_h = 1000, 1500

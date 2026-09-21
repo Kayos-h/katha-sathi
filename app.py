@@ -1,23 +1,22 @@
-"""Khata Sathi - HTTP server (stdlib only) + API + SSE live sync.
+"""Khata Sathi - Serverless HTTP Handler & API Layer.
 
-Serves the web app, the photo API, and the event stream that keeps
-every open screen (phone + laptop) in sync live. No dependencies.
+Cloud-native: Supabase Auth & Google OAuth integration, strict multi-tenancy (user_id),
+PostgreSQL database backend, and serverless-friendly sync polling.
+Runs on Vercel Python Serverless or standalone.
 """
 import base64
 import hashlib
+import hmac
 import io
 import json
 import os
-import queue
 import re
 import secrets
-import socket
-import subprocess
 import sys
-import threading
 import time
-import webbrowser
-import zlib
+import urllib.parse
+import urllib.request
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import db
@@ -28,36 +27,17 @@ import photos
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(APP_DIR, "web")
 
-SESSIONS = {}          # token -> expires_at (epoch)
-SESSION_TTL = 60 * 60 * 12  # 12h
-SSE_CLIENTS = []       # list of (queue, token)
-sse_lock = threading.Lock()
+SESSION_SECRET = os.environ.get("SESSION_SECRET", "khatasathi-cloud-secret-key-2083")
+SESSION_TTL = 60 * 60 * 24 * 7  # 7 days
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "").strip() or os.environ.get("SUPABASE_KEY", "").strip()
+SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "").strip()
 
 MONEY_NOTE = "Amounts are stored as plain numbers; the UI converts Devanagari digits."
 
 
-# ---------------- SSE ----------------
-
-def sse_broadcast(kind, payload):
-    msg = json.dumps({"kind": kind, "payload": payload}, ensure_ascii=False)
-    with sse_lock:
-        dead = []
-        for i, (q, _tok) in enumerate(SSE_CLIENTS):
-            try:
-                q.put_nowait(msg)
-            except queue.Full:
-                dead.append(i)
-        for i in reversed(dead):
-            try:
-                SSE_CLIENTS.pop(i)
-            except IndexError:
-                pass
-
-
-db.broadcast.sink = sse_broadcast  # db calls broadcast() after each change
-
-
-# ---------------- auth ----------------
+# ---------------- authentication & session management ----------------
 
 def hash_pin(pin, salt=None):
     salt = salt or secrets.token_hex(8)
@@ -74,34 +54,73 @@ def verify_pin(pin, stored):
     return secrets.compare_digest(digest.hex(), want)
 
 
-def auth_state():
-    return {
-        "has_account": db.get_setting("seller_name") is not None,
-        "store_name": db.get_setting("store_name", ""),
-        "seller_name": db.get_setting("seller_name", ""),
+def new_session(user_id="default", email="", seller_name=""):
+    """Generates a cryptographically signed, stateless session token."""
+    payload = {
+        "user_id": user_id,
+        "email": email,
+        "seller_name": seller_name,
+        "exp": int(time.time() + SESSION_TTL),
+        "nonce": secrets.token_hex(8),
     }
+    raw = json.dumps(payload).encode("utf-8")
+    b64_data = base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
+    sig = hmac.new(SESSION_SECRET.encode("utf-8"), b64_data.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{b64_data}.{sig}"
 
 
-def new_session():
-    token = secrets.token_hex(16)
-    SESSIONS[token] = time.time() + SESSION_TTL
-    return token
+def session_cookie(token, is_secure=False):
+    secure_flag = "; Secure" if is_secure else ""
+    return f"bs_session={token}; Path=/; Max-Age={SESSION_TTL}; HttpOnly; SameSite=Lax{secure_flag}"
 
 
-def session_cookie(token):
-    return "bs_session=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Lax" % (token, SESSION_TTL)
+def parse_jwt_payload(token):
+    """Safely decodes payload from a standard JWT or HMAC token."""
+    if not token or "." not in token:
+        return None
+    parts = token.split(".")
+    # Standard JWT (3 parts: header.payload.signature)
+    if len(parts) == 3:
+        b64_payload = parts[1]
+    # Stateless HMAC token (2 parts: payload.signature)
+    elif len(parts) == 2:
+        b64_payload = parts[0]
+        sig = parts[1]
+        expected_sig = hmac.new(SESSION_SECRET.encode("utf-8"), b64_payload.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not secrets.compare_digest(sig, expected_sig):
+            return None
+    else:
+        return None
+
+    try:
+        padded = b64_payload + "=" * ((4 - len(b64_payload) % 4) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("utf-8"))
+        payload = json.loads(raw.decode("utf-8"))
+        # Check expiration
+        if payload.get("exp") and payload["exp"] < time.time():
+            return None
+        return payload
+    except Exception:
+        return None
 
 
-def check_session(token):
-    exp = SESSIONS.get(token)
-    if not exp or exp < time.time():
-        SESSIONS.pop(token, None)
-        return False
-    return True
+def verify_token_user(token):
+    """Extracts user information (user_id, email, seller_name) from token."""
+    payload = parse_jwt_payload(token)
+    if not payload:
+        return None
 
+    # Supabase JWT tokens contain 'sub' as user UUID
+    user_id = payload.get("sub") or payload.get("user_id") or payload.get("id") or "default"
+    email = payload.get("email") or ""
+    user_meta = payload.get("user_metadata") or {}
+    seller_name = payload.get("seller_name") or user_meta.get("full_name") or user_meta.get("name") or (email.split("@")[0] if email else "")
 
-def drop_session(token):
-    SESSIONS.pop(token, None)
+    return {
+        "user_id": str(user_id),
+        "email": str(email),
+        "seller_name": str(seller_name),
+    }
 
 
 # ---------------- helpers ----------------
@@ -111,224 +130,17 @@ def jdump(obj):
 
 
 def _quote_fn(name):
-    """RFC 5987-safe filename for Content-Disposition (Devanagari-safe)."""
-    from urllib.parse import quote
-    return quote(name)
+    return urllib.parse.quote(name)
 
 
 def _qr_png_b64(url):
-    """Return a QR PNG as base64.
-
-    Prefer the qrcode package when installed; otherwise use a tiny built-in
-    Version 2-L byte-mode encoder, enough for the local IPv4 URLs this app
-    serves (for example http://192.168.1.69:8787).
-    """
     try:
         import qrcode
         buf = io.BytesIO()
         qrcode.make(url, box_size=8, border=2).save(buf, "PNG")
         return base64.b64encode(buf.getvalue()).decode()
-    except ImportError:
-        pass
-    try:
-        return base64.b64encode(_fallback_qr_png(url)).decode()
     except Exception:
         return None
-
-
-def _fallback_qr_png(text):
-    data = text.encode("utf-8")
-    if len(data) > 32:
-        raise ValueError("Fallback QR supports up to 32 bytes")
-    data_cw = _qr_data_codewords(data)
-    ec_cw = _qr_rs_remainder(data_cw, 10)
-    matrix = _qr_matrix_v2_l(data_cw + ec_cw)
-    from PIL import Image, ImageDraw
-    scale, border = 8, 4
-    size = len(matrix)
-    img = Image.new("RGB", ((size + border * 2) * scale,
-                            (size + border * 2) * scale), "white")
-    draw = ImageDraw.Draw(img)
-    for y, row in enumerate(matrix):
-        for x, dark in enumerate(row):
-            if dark:
-                x0 = (x + border) * scale
-                y0 = (y + border) * scale
-                draw.rectangle([x0, y0, x0 + scale - 1, y0 + scale - 1], fill="black")
-    buf = io.BytesIO()
-    img.save(buf, "PNG")
-    return buf.getvalue()
-
-
-def _qr_data_codewords(data):
-    bits = [0, 1, 0, 0]  # byte mode
-    bits += [(len(data) >> i) & 1 for i in range(7, -1, -1)]
-    for b in data:
-        bits += [(b >> i) & 1 for i in range(7, -1, -1)]
-    cap = 34 * 8  # QR version 2, error correction L
-    bits += [0] * min(4, cap - len(bits))
-    while len(bits) % 8:
-        bits.append(0)
-    out = []
-    for i in range(0, len(bits), 8):
-        v = 0
-        for bit in bits[i:i + 8]:
-            v = (v << 1) | bit
-        out.append(v)
-    pads = [0xEC, 0x11]
-    i = 0
-    while len(out) < 34:
-        out.append(pads[i % 2])
-        i += 1
-    return out
-
-
-def _qr_gf_tables():
-    exp = [0] * 512
-    log = [0] * 256
-    x = 1
-    for i in range(255):
-        exp[i] = x
-        log[x] = i
-        x <<= 1
-        if x & 0x100:
-            x ^= 0x11D
-    for i in range(255, 512):
-        exp[i] = exp[i - 255]
-    return exp, log
-
-
-def _qr_gf_mul(x, y):
-    if x == 0 or y == 0:
-        return 0
-    exp, log = _qr_gf_tables()
-    return exp[log[x] + log[y]]
-
-
-def _qr_rs_divisor(degree):
-    result = [0] * degree
-    result[degree - 1] = 1
-    root = 1
-    for _ in range(degree):
-        for j in range(degree):
-            result[j] = _qr_gf_mul(result[j], root)
-            if j + 1 < degree:
-                result[j] ^= result[j + 1]
-        root = _qr_gf_mul(root, 0x02)
-    return result
-
-
-def _qr_rs_remainder(data, degree):
-    divisor = _qr_rs_divisor(degree)
-    result = [0] * degree
-    for b in data:
-        factor = b ^ result.pop(0)
-        result.append(0)
-        for i, coef in enumerate(divisor):
-            result[i] ^= _qr_gf_mul(coef, factor)
-    return result
-
-
-def _qr_format_bits(mask):
-    data = (1 << 3) | mask  # EC level L = 01
-    rem = data << 10
-    for i in range(14, 9, -1):
-        if (rem >> i) & 1:
-            rem ^= 0x537 << (i - 10)
-    return ((data << 10) | rem) ^ 0x5412
-
-
-def _qr_matrix_v2_l(codewords):
-    size = 25
-    m = [[None for _ in range(size)] for _ in range(size)]
-
-    def setm(x, y, dark):
-        if 0 <= x < size and 0 <= y < size:
-            m[y][x] = bool(dark)
-
-    def reserve(x, y):
-        if 0 <= x < size and 0 <= y < size and m[y][x] is None:
-            m[y][x] = False
-
-    def finder(x, y):
-        for dy in range(-1, 8):
-            for dx in range(-1, 8):
-                xx, yy = x + dx, y + dy
-                if not (0 <= xx < size and 0 <= yy < size):
-                    continue
-                dark = (0 <= dx <= 6 and 0 <= dy <= 6 and
-                        (dx in (0, 6) or dy in (0, 6) or
-                         (2 <= dx <= 4 and 2 <= dy <= 4)))
-                setm(xx, yy, dark)
-
-    finder(0, 0)
-    finder(size - 7, 0)
-    finder(0, size - 7)
-    for i in range(8, size - 8):
-        setm(i, 6, i % 2 == 0)
-        setm(6, i, i % 2 == 0)
-    for dy in range(-2, 3):
-        for dx in range(-2, 3):
-            dist = max(abs(dx), abs(dy))
-            setm(18 + dx, 18 + dy, dist != 1)
-    setm(8, size - 8, True)
-    for i in range(9):
-        reserve(8, i)
-        reserve(i, 8)
-    for i in range(8):
-        reserve(size - 1 - i, 8)
-    for i in range(7):
-        reserve(8, size - 7 + i)
-
-    bits = []
-    for b in codewords:
-        bits += [(b >> i) & 1 for i in range(7, -1, -1)]
-    bit_i = 0
-    upward = True
-    x = size - 1
-    while x > 0:
-        if x == 6:
-            x -= 1
-        for vert in range(size):
-            y = size - 1 - vert if upward else vert
-            for dx in range(2):
-                xx = x - dx
-                if m[y][xx] is not None:
-                    continue
-                dark = bit_i < len(bits) and bits[bit_i] == 1
-                if (xx + y) % 2 == 0:
-                    dark = not dark
-                m[y][xx] = dark
-                bit_i += 1
-        upward = not upward
-        x -= 2
-
-    fmt = _qr_format_bits(0)
-    for i in range(6):
-        setm(8, i, (fmt >> i) & 1)
-    setm(8, 7, (fmt >> 6) & 1)
-    setm(8, 8, (fmt >> 7) & 1)
-    setm(7, 8, (fmt >> 8) & 1)
-    for i in range(9, 15):
-        setm(14 - i, 8, (fmt >> i) & 1)
-    for i in range(8):
-        setm(size - 1 - i, 8, (fmt >> i) & 1)
-    for i in range(8, 15):
-        setm(8, size - 15 + i, (fmt >> i) & 1)
-    return [[bool(c) for c in row] for row in m]
-
-
-def find_lan_ip():
-    """The LAN address the phone should open (QR code target)."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))  # never actually sends
-        ip = s.getsockname()[0]
-    except OSError:
-        ip = "127.0.0.1"
-    finally:
-        s.close()
-    return ip
 
 
 def read_json(handler):
@@ -340,7 +152,6 @@ def read_json(handler):
 
 
 def parse_amount(val):
-    """Accepts 1234, '1,234', 'रू 1,234', Devanagari digits, returns float or raises."""
     DEV = {
         "०": "0", "१": "1", "२": "2", "३": "3", "४": "4",
         "५": "5", "६": "6", "७": "7", "८": "8", "९": "9",
@@ -356,12 +167,6 @@ def parse_amount(val):
     if f != f or f in (float("inf"), float("-inf")):
         raise ValueError("That amount isn't a number")
     return f
-
-
-def gzip_if_wanted(handler, body, ctype):
-    # No gzip: everything is served on the local network where compression
-    # only adds CPU and decoding risk. Keep the helper for clarity of intent.
-    return body, ctype, False
 
 
 EXT_TYPES = {
@@ -382,13 +187,11 @@ EXT_TYPES = {
 # ---------------- request handler ----------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "Khata Sathi/1"
+    server_version = "Khata Sathi Cloud/2.0"
     protocol_version = "HTTP/1.1"
 
-    # ---- plumbing ----
-
     def log_message(self, fmt, *args):
-        pass  # keep the console clean; the audit log is the record
+        pass
 
     def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
         if isinstance(body, str):
@@ -402,55 +205,116 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _redirect(self, url):
+        self.send_response(302)
+        self.send_header("Location", url)
+        self.send_header("Cache-Control", "public, max-age=3600")
+        self.end_headers()
+
     def _json(self, code, obj):
         body = jdump(obj)
         extra = {}
         if "token" in obj and isinstance(obj.get("token"), str):
-            extra["Set-Cookie"] = session_cookie(obj["token"])
+            is_sec = self._is_secure()
+            extra["Set-Cookie"] = session_cookie(obj["token"], is_sec)
         self._send(code, body, extra=extra)
 
     def _err(self, code, msg):
         self._json(code, {"error": msg})
 
-    # ---- auth gate ----
+    def _is_secure(self):
+        proto = self.headers.get("X-Forwarded-Proto", "").lower()
+        return proto == "https"
 
     def _token(self):
         auth = self.headers.get("Authorization") or ""
         if auth.startswith("Bearer "):
             return auth[7:].strip()
-        return ""
-
-    def _authed(self):
-        if not auth_state()["has_account"]:
-            return True  # setup not done: everything open so first-run works
-        if check_session(self._token()):
-            return True
-        # plain <a href> downloads (PDF/Excel) can't send a Bearer header;
-        # the session cookie set at login covers them.
         cookie = self.headers.get("Cookie") or ""
         for part in cookie.split(";"):
             if part.strip().startswith("bs_session="):
-                if check_session(part.strip().split("=", 1)[1]):
-                    return True
-        return False
+                return part.strip().split("=", 1)[1]
+        return ""
+
+    def _get_auth_user(self):
+        token = self._token()
+        if not token:
+            return None
+        return verify_token_user(token)
+
+    def _get_user_id(self):
+        u = self._get_auth_user()
+        if u and u.get("user_id"):
+            return u["user_id"]
+        return "default"
+
+    def _authed(self):
+        return self._get_auth_user() is not None
+
+    def _app_url(self):
+        host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host") or "localhost"
+        proto = "https" if self._is_secure() or "vercel.app" in host else "http"
+        return f"{proto}://{host}"
+
+    def _clean_path(self):
+        params = self._get_query_params()
+        if "__path" in params:
+            raw_p = params["__path"].lstrip("/")
+            if raw_p.startswith("photo/"):
+                return "/" + raw_p
+            return "/api/" + raw_p
+        p = self.headers.get("x-matched-path") or self.headers.get("x-invoke-path") or self.headers.get("x-forwarded-uri") or self.path
+        p = p.split("?")[0]
+        if p.endswith("index.py") or p == "/api" or p == "/api/":
+            matched = self.headers.get("x-matched-path") or self.headers.get("x-invoke-path")
+            if matched and not matched.endswith("index.py"):
+                p = matched.split("?")[0]
+            else:
+                p = self.path.split("?")[0].replace("/api/index.py", "/api").replace("/index.py", "")
+                if not p:
+                    p = "/"
+        return p
+
+    def _get_query_params(self):
+        qs = ""
+        if "?" in self.path:
+            qs = self.path.split("?", 1)[1]
+        elif "?" in (self.headers.get("x-matched-path") or ""):
+            qs = self.headers.get("x-matched-path").split("?", 1)[1]
+        elif "?" in (self.headers.get("x-invoke-path") or ""):
+            qs = self.headers.get("x-invoke-path").split("?", 1)[1]
+        params = {}
+        if qs:
+            for kv in qs.split("&"):
+                if "=" in kv:
+                    k, v = kv.split("=", 1)
+                    params[k] = urllib.parse.unquote(v)
+        return params
 
     # ---- GET ----
 
     def do_GET(self):
-        path = self.path.split("?")[0]
+        path = self._clean_path()
         if path == "/":
             return self._serve_file("index.html")
         if path.startswith("/photo/"):
             return self._photo(path.split("/")[-1])
         if path == "/api/state":
-            return self._json(200, auth_state())
+            return self._api_state()
+        if path == "/api/auth/config":
+            return self._json(200, {
+                "supabase_url": SUPABASE_URL,
+                "supabase_anon_key": SUPABASE_ANON_KEY,
+            })
+        if path == "/api/auth/google-url":
+            return self._api_google_url()
         if path == "/api/qr":
             return self._qr()
-        if path == "/api/events":
-            return self._sse()
+        if path in ("/api/sync/poll", "/api/events"):
+            return self._sync_poll()
         if path.startswith("/api/"):
             return self._api_get(path)
-        # static file (subdirectories like /views/ are fine; no .. escapes)
+        # static file
         fname = path.lstrip("/")
         if ".." in fname or "\\" in fname or fname.startswith("/"):
             return self._err(404, "Not found")
@@ -466,184 +330,152 @@ class Handler(BaseHTTPRequestHandler):
             body = fh.read()
         self._send(200, body, ctype)
 
+    def _api_state(self):
+        user = self._get_auth_user()
+        if not user:
+            return self._json(200, {
+                "has_account": False,
+                "authenticated": False,
+                "user_id": None,
+                "seller_name": "",
+                "store_name": "",
+            })
+        uid = user["user_id"]
+        seller = db.get_setting("seller_name", user.get("seller_name") or "", user_id=uid)
+        store = db.get_setting("store_name", "", user_id=uid)
+        return self._json(200, {
+            "has_account": True,
+            "authenticated": True,
+            "user_id": uid,
+            "email": user.get("email", ""),
+            "seller_name": seller,
+            "store_name": store or (seller + "'s shop" if seller else "Khata Sathi"),
+        })
+
+    def _api_google_url(self):
+        app_url = self._app_url()
+        if not SUPABASE_URL:
+            # Fallback mock google auth for testing
+            mock_tok = new_session(user_id="google_user_test", email="user@gmail.com", seller_name="Google User")
+            return self._json(200, {"url": f"{app_url}/#access_token={mock_tok}&provider=google"})
+        redirect_uri = f"{app_url}/"
+        oauth_url = f"{SUPABASE_URL}/auth/v1/authorize?provider=google&redirect_to={urllib.parse.quote(redirect_uri, safe='')}"
+        return self._json(200, {"url": oauth_url})
+
     def _photo(self, fname):
-        # Photos are also loaded by plain <img> tags, which cannot send a
-        # Bearer header, so a session cookie works too. Filenames are
-        # unguessable (timestamp + random id).
-        if auth_state()["has_account"]:
-            ok = check_session(self._token())
-            if not ok:
-                cookie = self.headers.get("Cookie") or ""
-                for part in cookie.split(";"):
-                    if part.strip().startswith("bs_session="):
-                        if check_session(part.strip().split("=", 1)[1]):
-                            ok = True
-            if not ok:
-                return self._err(401, "Not signed in")
-        data, ctype = photos.serve_photo(fname)
-        if data is None:
-            return self._err(404, "Photo not found")
-        self._send(200, data, ctype or "image/jpeg")
+        # Photo feature is temporarily under construction
+        return self._err(501, "Photo feature is temporarily under construction")
 
     def _qr(self):
         if not self._authed():
             return self._err(401, "Not signed in")
-        ip = find_lan_ip()
-        port = self.server.server_address[1]
-        url = "http://%s:%d" % (ip, port)
+        url = self._app_url()
         qr_b64 = _qr_png_b64(url)
         return self._json(200, {"url": url, "qr_png_b64": qr_b64})
 
-    # ---- SSE ----
-
-    def _sse(self):
-        # EventSource cannot send headers, so the token may also arrive as
-        # ?token= or via the session cookie.
-        self.close_connection = True
-        token = self._token()
-        qs = self.path.split("?", 1)[1] if "?" in self.path else ""
-        for kv in qs.split("&"):
-            if kv.startswith("token="):
-                token = kv[6:]
-        if auth_state()["has_account"]:
-            ok = check_session(token)
-            if not ok:
-                cookie = self.headers.get("Cookie") or ""
-                for part in cookie.split(";"):
-                    if part.strip().startswith("bs_session="):
-                        if check_session(part.strip().split("=", 1)[1]):
-                            ok = True
-            if not ok:
-                return self._err(401, "Not signed in")
-        q = queue.Queue(maxsize=200)
-        with sse_lock:
-            SSE_CLIENTS.append((q, token))
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "keep-alive")
-        self.end_headers()
+    def _sync_poll(self):
+        if not self._authed():
+            return self._err(401, "Not signed in")
+        uid = self._get_user_id()
+        params = self._get_query_params()
         try:
-            self.wfile.write(b": hello\n\n")
-            self.wfile.flush()
-            while True:
-                try:
-                    msg = q.get(timeout=20)
-                except queue.Empty:
-                    self.wfile.write(b": keepalive\n\n")
-                    self.wfile.flush()
-                    continue
-                # session expired mid-stream: close politely
-                if auth_state()["has_account"] and not check_session(token):
-                    break
-                self.wfile.write(("data: " + msg + "\n\n").encode("utf-8"))
-                self.wfile.flush()
-        except (ConnectionAbortedError, BrokenPipeError, OSError):
-            pass
-        finally:
-            with sse_lock:
-                for i, (qq, tt) in enumerate(SSE_CLIENTS):
-                    if qq is q:
-                        SSE_CLIENTS.pop(i)
-                        break
-
-    # ---- GET api ----
+            since_id = int(params.get("since", 0))
+        except ValueError:
+            since_id = 0
+        try:
+            res = db.get_sync_events(since_id, user_id=uid)
+            return self._json(200, res)
+        except Exception:
+            return self._json(200, {"events": [], "latest_id": since_id})
 
     def _api_get(self, path):
         if not self._authed():
             return self._err(401, "Not signed in")
-        qs = self.path.split("?", 1)[-1] if "?" in self.path else ""
-        params = {}
-        if qs:
-            for kv in qs.split("&"):
-                if "=" in kv:
-                    k, v = kv.split("=", 1)
-                    params[k] = v
+        uid = self._get_user_id()
+        params = self._get_query_params()
         try:
             if path == "/api/people":
-                return self._json(200, {"people": db.list_people()})
+                return self._json(200, {"people": db.list_people(user_id=uid)})
             if path == "/api/dashboard":
-                return self._json(200, db.dashboard())
+                return self._json(200, db.dashboard(user_id=uid))
             if path == "/api/day":
                 d = params.get("date")
-                return self._json(200, db.day_summary(d))
+                return self._json(200, db.day_summary(d, user_id=uid))
             if path == "/api/person":
                 pid = params.get("id")
                 if not pid:
                     return self._err(400, "Missing id")
-                return self._json(200, db.get_person(pid))
+                return self._json(200, db.get_person(pid, user_id=uid))
             if path == "/api/ledger":
                 pid = params.get("id")
                 if not pid:
                     return self._err(400, "Missing id")
-                return self._json(200, db.get_ledger(pid))
+                return self._json(200, db.get_ledger(pid, user_id=uid))
             if path == "/api/openbills":
                 pid = params.get("id")
                 if not pid:
                     return self._err(400, "Missing id")
-                return self._json(200, {"bills": db.open_bills(pid), "total": db.get_person(pid)["balance"]})
+                return self._json(200, {"bills": db.open_bills(pid, user_id=uid), "total": db.get_person(pid, user_id=uid)["balance"]})
             if path == "/api/activity":
                 limit = int(params.get("limit") or 30)
                 pid = params.get("person")
-                return self._json(200, {"items": db.get_activity(limit, pid)})
+                return self._json(200, {"items": db.get_activity(limit, pid, user_id=uid)})
             if path == "/api/search":
                 q = params.get("q", "")
-                return self._json(200, {"results": db.search_people(q)})
+                return self._json(200, {"results": db.search_people(q, user_id=uid)})
             if path == "/api/audit":
                 q = params.get("q", "")
-                return self._json(200, {"items": db.audit_recent(200, q)})
+                return self._json(200, {"items": db.audit_recent(200, q, user_id=uid)})
             if path == "/api/ai/status":
-                # reserved for the v1.5 AI reader; always manual for now
                 return self._json(200, {"mode": "manual", "provider": None,
-                                        "note": "AI bill reading arrives in v1.5 - the "
-                                                "confirm screen will stay the same."})
+                                        "note": "AI bill reading arrives in v1.5."})
             if path == "/api/stats":
-                return self._json(200, db.stats_counts())
+                return self._json(200, db.stats_counts(user_id=uid))
             if path == "/api/backup.json":
-                snap = db.snapshot()
+                snap = db.snapshot(user_id=uid)
                 return self._send(
                     200, jdump(snap), "application/json; charset=utf-8",
                     {"Content-Disposition": 'attachment; filename="khatasathi-backup.json"'},
                 )
             if path == "/api/export.csv":
-                return self._api_export_csv()
+                return self._api_export_csv(uid)
             if path == "/api/khata/pdf":
-                return self._api_khata_file(params, "pdf")
+                return self._api_khata_file(params, "pdf", uid)
             if path == "/api/khata/xlsx":
-                return self._api_khata_file(params, "xlsx")
+                return self._api_khata_file(params, "xlsx", uid)
             if path == "/api/bill/pdf":
-                return self._api_bill_pdf(params)
+                return self._api_bill_pdf(params, uid)
             if path == "/api/galla":
-                return self._json(200, db.galla_summary(params.get("date")))
+                return self._json(200, db.galla_summary(params.get("date"), user_id=uid))
             if path == "/api/galla/recent":
                 return self._json(200, {"days": db.galla_recent(
-                    int(params.get("days") or 7))})
+                    int(params.get("days") or 7), user_id=uid)})
             if path == "/api/galla/pdf":
-                return self._api_galla_pdf(params)
+                return self._api_galla_pdf(params, uid)
             if path == "/api/bill":
                 bid = params.get("id")
                 if not bid:
                     return self._err(400, "Missing id")
-                b = db.get_bill_full(bid)
-                b["allocations"] = db.payment_alloc_for_bill(bid)
+                b = db.get_bill_full(bid, user_id=uid)
+                b["allocations"] = db.payment_alloc_for_bill(bid, user_id=uid)
                 return self._json(200, b)
             if path == "/api/payment":
                 pmt_id = params.get("id")
                 if not pmt_id:
                     return self._err(400, "Missing id")
-                return self._json(200, db.payment_detail(pmt_id))
+                return self._json(200, db.payment_detail(pmt_id, user_id=uid))
             return self._err(404, "Unknown API route")
         except ValueError as e:
             return self._err(404 if "not found" in str(e).lower() else 400, str(e))
         except Exception as e:
             return self._err(500, "Server error: " + str(e))
 
-    def _api_khata_file(self, params, kind):
+    def _api_khata_file(self, params, kind, uid):
         pid = params.get("id")
         if not pid:
             return self._err(400, "Missing id")
-        data = db.khata_export(pid)
-        store = db.get_setting("store_name", "")
+        data = db.khata_export(pid, user_id=uid)
+        store = db.get_setting("store_name", "", user_id=uid) or ""
         if kind == "pdf":
             body, fname = exporters.khata_pdf(data, store)
             ctype = "application/pdf"
@@ -656,32 +488,32 @@ class Handler(BaseHTTPRequestHandler):
                 "attachment; filename*=UTF-8''" + _quote_fn(fname),
         })
 
-    def _api_bill_pdf(self, params):
+    def _api_bill_pdf(self, params, uid):
         bid = params.get("id")
         if not bid:
             return self._err(400, "Missing id")
-        bill = db.get_bill_full(bid)
-        person = db.get_person(bill["person_id"])
-        store = db.get_setting("store_name", "")
+        bill = db.get_bill_full(bid, user_id=uid)
+        person = db.get_person(bill["person_id"], user_id=uid)
+        store = db.get_setting("store_name", "", user_id=uid) or ""
         body, fname = exporters.bill_pdf(bill, person, store)
         return self._send(200, body, "application/pdf", {
             "Content-Disposition":
                 "attachment; filename*=UTF-8''" + _quote_fn(fname),
         })
 
-    def _api_galla_pdf(self, params):
-        data = db.galla_summary(params.get("date"))
-        store = db.get_setting("store_name", "")
+    def _api_galla_pdf(self, params, uid):
+        data = db.galla_summary(params.get("date"), user_id=uid)
+        store = db.get_setting("store_name", "", user_id=uid) or ""
         body, fname = exporters.galla_pdf(data, store)
         return self._send(200, body, "application/pdf", {
             "Content-Disposition":
                 "attachment; filename*=UTF-8''" + _quote_fn(fname),
         })
 
-    def _api_export_csv(self):
+    def _api_export_csv(self, uid):
         lines = ["person,kind,amount,remaining,status,note,date"]
-        for p in db.list_people():
-            led = db.get_ledger(p["id"])
+        for p in db.list_people(user_id=uid):
+            led = db.get_ledger(p["id"], user_id=uid)
             for r in led["rows"]:
                 lines.append(",".join([
                     '"' + led["person"]["name"].replace('"', '""') + '"',
@@ -698,9 +530,15 @@ class Handler(BaseHTTPRequestHandler):
     # ---- POST ----
 
     def do_POST(self):
-        path = self.path.split("?")[0]
+        path = self._clean_path()
         try:
-            # auth routes are open (they create the session / account)
+            # Auth endpoints
+            if path == "/api/auth/signup":
+                return self._api_auth_signup()
+            if path == "/api/auth/login":
+                return self._api_auth_login()
+            if path == "/api/auth/recover":
+                return self._api_auth_recover()
             if path == "/api/setup":
                 return self._api_setup()
             if path == "/api/login":
@@ -708,55 +546,65 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/reset-pin":
                 return self._api_reset_pin()
             if path == "/api/logout":
-                drop_session(self._token())
                 return self._json(200, {"ok": True})
-            if path == "/api/photo/check":
-                return self._api_photo_check()
+
+            # Photo endpoints (Temporarily under construction)
+            if path in ("/api/photo/check", "/api/photo/upload", "/api/photo/save"):
+                return self._json(200, {
+                    "ok": True,
+                    "status": "disabled",
+                    "message": "Photo upload is temporarily under construction",
+                    "problems": [],
+                    "duplicate": None,
+                })
+
             if not self._authed():
                 return self._err(401, "Not signed in")
+            uid = self._get_user_id()
+
             if path == "/api/people/add":
                 d = read_json(self)
-                pid = db.create_person(d.get("name"), d.get("phone") or "", d.get("notes") or "")
+                pid = db.create_person(d.get("name"), d.get("phone") or "", d.get("notes") or "", user_id=uid)
                 return self._json(200, {"id": pid})
             if path == "/api/people/update":
                 d = read_json(self)
-                db.update_person(d.get("id"), d.get("name"), d.get("phone"), d.get("notes"))
+                db.update_person(d.get("id"), d.get("name"), d.get("phone"), d.get("notes"), user_id=uid)
                 return self._json(200, {"ok": True})
             if path == "/api/people/merge":
                 d = read_json(self)
-                db.merge_people(d.get("primary"), d.get("dup"))
+                db.merge_people(d.get("primary"), d.get("dup"), user_id=uid)
                 return self._json(200, {"ok": True})
             if path == "/api/bills/add":
-                return self._api_bill_add()
+                return self._api_bill_add(uid)
             if path == "/api/bills/itemized/add":
-                return self._api_bill_itemized_add()
+                return self._api_bill_itemized_add(uid)
             if path == "/api/bills/update":
                 d = read_json(self)
-                db.update_bill(d.get("id"), d.get("amount"), d.get("note"))
+                db.update_bill(d.get("id"), d.get("amount"), d.get("note"), user_id=uid)
                 return self._json(200, {"ok": True})
             if path == "/api/bills/void":
                 d = read_json(self)
-                db.set_bill_void(d.get("id"), True)
+                db.set_bill_void(d.get("id"), True, user_id=uid)
                 return self._json(200, {"ok": True})
             if path == "/api/bills/unvoid":
                 d = read_json(self)
-                db.set_bill_void(d.get("id"), False)
+                db.set_bill_void(d.get("id"), False, user_id=uid)
                 return self._json(200, {"ok": True})
             if path == "/api/payments/preview":
                 d = read_json(self)
                 out = db.payment_preview(d.get("person_id"), parse_amount(d.get("amount")),
-                                         bill_id=d.get("bill_id"))
+                                         bill_id=d.get("bill_id"), user_id=uid)
                 return self._json(200, out)
             if path == "/api/payments/add":
-                return self._api_payment_add()
+                return self._api_payment_add(uid)
             if path == "/api/payments/undo":
                 d = read_json(self)
-                db.undo_payment(d.get("id"), d.get("reason") or "")
+                db.undo_payment(d.get("id"), d.get("reason") or "", user_id=uid)
                 return self._json(200, {"ok": True})
             if path == "/api/galla/open":
                 d = read_json(self)
                 out = db.galla_open(parse_amount(d.get("opening")),
-                                    d.get("date"), d.get("note") or "")
+                                    d.get("date"), d.get("note") or "", user_id=uid)
                 return self._json(200, out)
             if path == "/api/galla/entry":
                 d = read_json(self)
@@ -764,83 +612,201 @@ class Handler(BaseHTTPRequestHandler):
                 if d.get("direction") not in ("in", "out"):
                     return self._err(400, "Direction must be 'in' or 'out'")
                 out = db.galla_add_entry(direction, parse_amount(d.get("amount")),
-                                         d.get("note") or "", d.get("date"))
+                                         d.get("note") or "", d.get("date"), user_id=uid)
                 return self._json(200, out)
             if path == "/api/galla/close":
                 d = read_json(self)
                 out = db.galla_close(parse_amount(d.get("closing")),
-                                     d.get("date"))
+                                     d.get("date"), user_id=uid)
                 return self._json(200, out)
             if path == "/api/galla/entry/undo":
                 d = read_json(self)
-                db.galla_undo_entry(d.get("id"))
+                db.galla_undo_entry(d.get("id"), user_id=uid)
                 return self._json(200, {"ok": True})
             if path == "/api/settings":
                 d = read_json(self)
                 for k in ("store_name", "seller_name", "theme"):
                     if k in d:
-                        db.set_setting(k, d[k])
+                        db.set_setting(k, d[k], user_id=uid)
                 if "new_pin" in d and d["new_pin"]:
-                    if "current_pin" not in d or not verify_pin(d["current_pin"], db.get_setting("pin") or ""):
+                    if "current_pin" not in d or not verify_pin(d["current_pin"], db.get_setting("pin", user_id=uid) or ""):
                         return self._err(400, "Current PIN is wrong")
-                    db.set_setting("pin", hash_pin(str(d["new_pin"])))
+                    db.set_setting("pin", hash_pin(str(d["new_pin"])), user_id=uid)
                 return self._json(200, {"ok": True})
             if path == "/api/backup/restore":
                 d = read_json(self)
-                db.restore(d.get("snapshot") or {})
+                db.restore(d.get("snapshot") or {}, user_id=uid)
                 return self._json(200, {"ok": True})
             if path == "/api/demo":
-                demo.load_demo()
+                demo.load_demo(user_id=uid)
                 return self._json(200, {"ok": True})
             if path == "/api/demo/clear":
-                # removes ALL shop data (demo or real) but keeps the account;
-                # demo.reload is the "start over with demo" path, this is
-                # "remove the demo data and use the shop for real"
-                db.clear_data(keep_settings=True)
-                db.set_setting("store_name", "")
+                db.clear_data(keep_settings=True, user_id=uid)
+                db.set_setting("store_name", "", user_id=uid)
                 return self._json(200, {"ok": True})
             if path == "/api/ai/status":
-                # reserved for the v1.5 AI reader; always manual for now
                 return self._json(200, {"mode": "manual", "provider": None,
-                                        "note": "AI bill reading arrives in v1.5 - the "
-                                                "confirm screen will stay the same."})
+                                        "note": "AI bill reading arrives in v1.5."})
             return self._err(404, "Unknown API route")
         except ValueError as e:
             return self._err(400, str(e))
         except Exception as e:
             return self._err(500, "Server error: " + str(e))
 
+    def _api_auth_signup(self):
+        d = read_json(self)
+        email = (d.get("email") or "").strip()
+        password = str(d.get("password") or "").strip()
+        seller_name = (d.get("seller_name") or d.get("name") or "").strip()
+        store_name = (d.get("store_name") or "").strip()
+
+        if not email or "@" not in email:
+            return self._err(400, "A valid email address is required")
+        if not password or len(password) < 6:
+            return self._err(400, "Password must be at least 6 characters")
+        if not seller_name:
+            seller_name = email.split("@")[0]
+
+        if SUPABASE_URL and SUPABASE_ANON_KEY:
+            try:
+                signup_payload = json.dumps({
+                    "email": email,
+                    "password": password,
+                    "data": {"full_name": seller_name, "store_name": store_name},
+                }).encode("utf-8")
+                req = urllib.request.Request(
+                    f"{SUPABASE_URL}/auth/v1/signup",
+                    data=signup_payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "apikey": SUPABASE_ANON_KEY,
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=12) as resp:
+                    res = json.loads(resp.read().decode("utf-8"))
+                user_id = res.get("id") or (res.get("user") or {}).get("id") or res.get("sub")
+                token = res.get("access_token") or new_session(user_id=user_id, email=email, seller_name=seller_name)
+                if user_id:
+                    db.set_setting("seller_name", seller_name, user_id=user_id)
+                    db.set_setting("store_name", store_name or (seller_name + "'s shop"), user_id=user_id)
+                return self._json(200, {"ok": True, "token": token, "user": res})
+            except urllib.error.HTTPError as e:
+                try:
+                    err_json = json.loads(e.read().decode("utf-8"))
+                    msg = err_json.get("error_description") or err_json.get("msg") or err_json.get("message") or str(e)
+                except Exception:
+                    msg = str(e)
+                return self._err(e.code, msg)
+            except Exception as e:
+                return self._err(500, f"Supabase auth error: {e}")
+
+        # Local test fallback
+        user_id = "usr_" + hashlib.md5(email.encode()).hexdigest()[:10]
+        token = new_session(user_id=user_id, email=email, seller_name=seller_name)
+        db.set_setting("seller_name", seller_name, user_id=user_id)
+        db.set_setting("store_name", store_name or (seller_name + "'s shop"), user_id=user_id)
+        return self._json(200, {"ok": True, "token": token, "user_id": user_id})
+
+    def _api_auth_login(self):
+        d = read_json(self)
+        email = (d.get("email") or "").strip()
+        password = str(d.get("password") or "").strip()
+
+        if not email or not password:
+            return self._err(400, "Email and password are required")
+
+        if SUPABASE_URL and SUPABASE_ANON_KEY:
+            try:
+                login_payload = json.dumps({
+                    "email": email,
+                    "password": password,
+                }).encode("utf-8")
+                req = urllib.request.Request(
+                    f"{SUPABASE_URL}/auth/v1/token?grant_type=password",
+                    data=login_payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "apikey": SUPABASE_ANON_KEY,
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=12) as resp:
+                    res = json.loads(resp.read().decode("utf-8"))
+                user_id = (res.get("user") or {}).get("id") or res.get("sub")
+                token = res.get("access_token")
+                return self._json(200, {"ok": True, "token": token, "user_id": user_id})
+            except urllib.error.HTTPError as e:
+                try:
+                    err_json = json.loads(e.read().decode("utf-8"))
+                    msg = err_json.get("error_description") or err_json.get("msg") or err_json.get("message") or "Invalid email or password"
+                except Exception:
+                    msg = "Invalid email or password"
+                return self._err(e.code, msg)
+            except Exception as e:
+                return self._err(500, f"Supabase login error: {e}")
+
+        # Local test fallback
+        user_id = "usr_" + hashlib.md5(email.encode()).hexdigest()[:10]
+        seller_name = db.get_setting("seller_name", email.split("@")[0], user_id=user_id)
+        token = new_session(user_id=user_id, email=email, seller_name=seller_name)
+        return self._json(200, {"ok": True, "token": token, "user_id": user_id})
+
+    def _api_auth_recover(self):
+        d = read_json(self)
+        email = (d.get("email") or "").strip()
+        if not email:
+            return self._err(400, "Email is required")
+        if SUPABASE_URL and SUPABASE_ANON_KEY:
+            try:
+                req = urllib.request.Request(
+                    f"{SUPABASE_URL}/auth/v1/recover",
+                    data=json.dumps({"email": email}).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "apikey": SUPABASE_ANON_KEY},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=12):
+                    pass
+            except Exception:
+                pass
+        return self._json(200, {"ok": True, "message": "If that email exists, a password reset link has been sent."})
+
     def _api_setup(self):
         d = read_json(self)
         name = (d.get("name") or "").strip()
         pin = str(d.get("pin") or "").strip()
         store = (d.get("store_name") or "").strip()
+        uid = (d.get("user_id") or "").strip() or ("usr_" + hashlib.md5(name.encode()).hexdigest()[:10])
         if not name:
             return self._err(400, "Seller name is required")
         if not re.fullmatch(r"\d{4,8}", pin):
             return self._err(400, "PIN must be 4-8 digits")
-        if auth_state()["has_account"]:
-            return self._err(400, "Account already exists - sign in instead")
-        db.set_setting("seller_name", name)
-        db.set_setting("store_name", store or (name + "'s shop"))
-        db.set_setting("pin", hash_pin(pin))
-        return self._json(200, {"ok": True, "token": new_session()})
+        db.set_setting("seller_name", name, user_id=uid)
+        db.set_setting("store_name", store or (name + "'s shop"), user_id=uid)
+        db.set_setting("pin", hash_pin(pin), user_id=uid)
+        return self._json(200, {"ok": True, "token": new_session(user_id=uid, seller_name=name), "user_id": uid})
 
     def _api_login(self):
         d = read_json(self)
         pin = str(d.get("pin") or "").strip()
-        stored = db.get_setting("pin")
+        uid = (d.get("user_id") or "").strip() or self._get_user_id()
+        stored = db.get_setting("pin", user_id=uid)
+        if not stored:
+            # Check default
+            stored = db.get_setting("pin", user_id="default")
+            if stored:
+                uid = "default"
         if not stored:
             return self._err(400, "No account yet - set one up first")
         if not verify_pin(pin, stored):
             return self._err(401, "Wrong PIN")
-        return self._json(200, {"ok": True, "token": new_session()})
+        seller_name = db.get_setting("seller_name", "", user_id=uid)
+        return self._json(200, {"ok": True, "token": new_session(user_id=uid, seller_name=seller_name), "user_id": uid})
 
     def _api_reset_pin(self):
         d = read_json(self)
-        if not auth_state()["has_account"]:
-            return self._err(400, "No account yet - set one up first")
-        seller_name = str(db.get_setting("seller_name") or "").strip()
+        uid = self._get_user_id()
+        seller_name = str(db.get_setting("seller_name", user_id=uid) or "").strip()
         supplied_name = str(d.get("seller_name") or "").strip()
         new_pin = str(d.get("new_pin") or "").strip()
         confirm_pin = str(d.get("confirm_pin") or "").strip()
@@ -852,29 +818,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._err(400, "PIN must be 4-8 digits")
         if new_pin != confirm_pin:
             return self._err(400, "PINs do not match")
-        db.set_setting("pin", hash_pin(new_pin))
-        SESSIONS.clear()
-        return self._json(200, {"ok": True, "token": new_session()})
+        db.set_setting("pin", hash_pin(new_pin), user_id=uid)
+        return self._json(200, {"ok": True, "token": new_session(user_id=uid, seller_name=seller_name)})
 
-    def _api_photo_check(self):
-        """Receives raw photo bytes; returns quality verdict + saves nothing."""
-        n = int(self.headers.get("Content-Length") or 0)
-        if n <= 0 or n > 40 * 1024 * 1024:
-            return self._err(400, "No photo received or photo too large (max 40MB)")
-        data = self.rfile.read(n)
-        ext = photos.sniff_image(data)
-        if not ext:
-            return self._err(400, "That file isn't a photo (JPEG/PNG/WebP only)")
-        ok, problems = photos.check_quality(data)
-        dup = None
-        if ok:
-            is_dup = photos.duplicate_check(data)
-            if is_dup:
-                dup = "This exact photo was already used on another bill. " \
-                      "Continue only if this is really a different purchase."
-        return self._json(200, {"ok": ok, "problems": problems, "duplicate": dup})
-
-    def _api_bill_add(self):
+    def _api_bill_add(self, uid):
         d = read_json(self)
         person_id = d.get("person_id")
         person_name = (d.get("person_name") or "").strip()
@@ -883,115 +830,145 @@ class Handler(BaseHTTPRequestHandler):
         amount = parse_amount(d.get("amount"))
         paid_raw = str(d.get("paid_amount") or "").strip()
         paid_amount = parse_amount(paid_raw) if paid_raw else 0
-        db.require_galla_open()
+        db.require_galla_open(user_id=uid)
         if not person_id:
-            person_id = db.create_person(person_name, d.get("phone") or "")
-        photo = ""
-        if d.get("photo_b64"):
-            try:
-                raw = base64.b64decode(d["photo_b64"])
-            except Exception:
-                return self._err(400, "Photo data couldn't be decoded")
-            ext = photos.sniff_image(raw)
-            if not ext:
-                return self._err(400, "The attached file isn't a photo")
-            photo = photos.save_photo(raw, ext)
+            person_id = db.create_person(person_name, d.get("phone") or "", user_id=uid)
         res = db.create_bill(
-            person_id, amount, photo=photo, note=d.get("note") or "",
+            person_id, amount, photo="", note=d.get("note") or "",
             already_paid=bool(d.get("already_paid")), paid_amount=paid_amount,
-            paid_note=d.get("paid_note") or "",
+            paid_note=d.get("paid_note") or "", user_id=uid,
         )
         res["person_id"] = person_id
         return self._json(200, res)
 
-    def _api_bill_itemized_add(self):
-        """Estimate-form bill: person + line items (+ optional photo)."""
+    def _api_bill_itemized_add(self, uid):
         d = read_json(self)
         person_id = d.get("person_id")
         person_name = (d.get("person_name") or "").strip()
         if not person_id and not person_name:
             return self._err(400, "Pick a person or type a new name")
-        db.require_galla_open()
+        db.require_galla_open(user_id=uid)
         if not person_id:
-            person_id = db.create_person(person_name, d.get("phone") or "")
+            person_id = db.create_person(person_name, d.get("phone") or "", user_id=uid)
         paid_raw = str(d.get("paid_amount") or "").strip()
         paid_amount = parse_amount(paid_raw) if paid_raw else 0
-        photo = ""
-        if d.get("photo_b64"):
-            try:
-                raw = base64.b64decode(d["photo_b64"])
-            except Exception:
-                return self._err(400, "Photo data couldn't be decoded")
-            ext = photos.sniff_image(raw)
-            if not ext:
-                return self._err(400, "The attached file isn't a photo")
-            photo = photos.save_photo(raw, ext)
         res = db.create_itemized_bill(
-            person_id, d.get("items"), photo=photo, note=d.get("note") or "",
+            person_id, d.get("items"), photo="", note=d.get("note") or "",
             already_paid=bool(d.get("already_paid")), paid_amount=paid_amount,
-            paid_note=d.get("paid_note") or "",
+            paid_note=d.get("paid_note") or "", user_id=uid,
         )
         res["person_id"] = person_id
         return self._json(200, res)
 
-    def _api_payment_add(self):
+    def _api_payment_add(self, uid):
         d = read_json(self)
         amount = parse_amount(d.get("amount"))
-        db.require_galla_open()
-        photo = ""
-        if d.get("photo_b64"):
-            try:
-                raw = base64.b64decode(d["photo_b64"])
-            except Exception:
-                return self._err(400, "Photo data couldn't be decoded")
-            ext = photos.sniff_image(raw)
-            if not ext:
-                return self._err(400, "The attached file isn't a photo")
-            photo = photos.save_photo(raw, ext)
+        db.require_galla_open(user_id=uid)
         res = db.record_payment(
-            d.get("person_id"), amount, note=d.get("note") or "", photo=photo,
-            bill_id=d.get("bill_id") or None,
+            d.get("person_id"), amount, note=d.get("note") or "", photo="",
+            bill_id=d.get("bill_id") or None, user_id=uid,
         )
         return self._json(200, res)
 
 
-class QuietThreadingHTTPServer(ThreadingHTTPServer):
-    def handle_error(self, request, client_address):
-        exc = sys.exc_info()[1]
-        if isinstance(exc, (BrokenPipeError, ConnectionAbortedError,
-                            ConnectionResetError, TimeoutError)):
-            return
-        super().handle_error(request, client_address)
+# WSGI application adapter for Vercel / serverless runtimes
+def wsgi_app(environ, start_response):
+    from io import BytesIO
 
+    headers_in = {}
+    for k, v in environ.items():
+        if k.startswith("HTTP_"):
+            name = k[5:].replace("_", "-").title()
+            headers_in[name] = v
+        elif k in ("CONTENT_TYPE", "CONTENT_LENGTH"):
+            name = k.replace("_", "-").title()
+            headers_in[name] = v
 
-# ---------------- main ----------------
+    class MockSocket:
+        def __init__(self, rfile, wfile):
+            self.rfile = rfile
+            self.wfile = wfile
 
-def run(host="0.0.0.0", port=8787, open_browser=True):
-    db.init()
-    # pick a free port if busy
-    srv = None
-    for p in ([port] + list(range(port, port + 20))):
-        try:
-            srv = QuietThreadingHTTPServer((host, p), Handler)
-            break
-        except OSError:
-            continue
-    if srv is None:
-        print("Khata Sathi could not find a free port near", port)
-        sys.exit(1)
-    ip = find_lan_ip()
-    actual_port = srv.server_address[1]
-    url = "http://%s:%d" % (ip, actual_port)
-    print("Khata Sathi is running.")
-    print("  On this laptop :  http://localhost:%d" % actual_port)
-    print("  On the phone   :  %s   (scan the QR in the app - top right menu)" % url)
-    if open_browser:
-        threading.Timer(0.5, lambda: webbrowser.open("http://localhost:%d" % actual_port)).start()
+        def makefile(self, mode, *args, **kwargs):
+            return self.rfile if "r" in mode else self.wfile
+
+    rfile = environ.get("wsgi.input") or BytesIO(b"")
+    wfile = BytesIO()
+
     try:
-        srv.serve_forever()
+        handler = Handler(MockSocket(rfile, wfile), ("127.0.0.1", 80), None)
+        path = environ.get("PATH_INFO", "/")
+        query = environ.get("QUERY_STRING", "")
+        handler.path = path + ("?" + query if query else "")
+        handler.command = environ.get("REQUEST_METHOD", "GET")
+        handler.headers = headers_in
+
+        # Initialize schema
+        try:
+            db.init()
+        except Exception:
+            pass
+
+        if handler.command == "GET":
+            handler.do_GET()
+        elif handler.command == "POST":
+            handler.do_POST()
+        elif handler.command == "OPTIONS":
+            handler.send_response(200)
+            handler.send_header("Access-Control-Allow-Origin", "*")
+            handler.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+            handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            handler.end_headers()
+        else:
+            handler._err(405, "Method not allowed")
+    except Exception as e:
+        body = json.dumps({"error": f"Server error: {e}"}).encode("utf-8")
+        start_response("500 Internal Server Error", [
+            ("Content-Type", "application/json"),
+            ("Content-Length", str(len(body)))
+        ])
+        return [body]
+
+    wfile.seek(0)
+    raw_response = wfile.read()
+    if not raw_response:
+        start_response("200 OK", [("Content-Length", "0")])
+        return [b""]
+
+    try:
+        header_part, body_part = raw_response.split(b"\r\n\r\n", 1)
+    except ValueError:
+        header_part, body_part = raw_response, b""
+
+    header_lines = header_part.decode("iso-8859-1").split("\r\n")
+    status_line = header_lines[0]
+    status = " ".join(status_line.split(" ")[1:]) if " " in status_line else "200 OK"
+
+    response_headers = []
+    for line in header_lines[1:]:
+        if ":" in line:
+            hn, hv = line.split(":", 1)
+            response_headers.append((hn.strip(), hv.strip()))
+
+    start_response(status, response_headers)
+    return [body_part]
+
+
+def run(host="0.0.0.0", port=8787, open_browser=False):
+    db.init()
+    server = ThreadingHTTPServer((host, port), Handler)
+    print(f"Khata Sathi Cloud running at http://{host}:{port}")
+    try:
+        server.serve_forever()
     except KeyboardInterrupt:
         pass
 
 
+def main():
+    port = int(os.environ.get("PORT", 8787))
+    run("0.0.0.0", port)
+
+
 if __name__ == "__main__":
-    run(open_browser=("-no-browser" not in sys.argv))
+    main()
+

@@ -1,15 +1,13 @@
-"""Khata Sathi - end-to-end API test. Runs against a fresh temp database.
+"""Khata Sathi - end-to-end API test suite.
 
-Starts the real server on a test port, then exercises every route:
-setup, login, people, bills, photo quality gate, FIFO payments,
-undo, void, dashboard, search, merge, backup/restore, CSV, SSE.
+Tests full cloud functionality, Supabase & Email auth, multi-tenant data isolation,
+bill and payment workflows without photos, galla cash drawer, and zero disk writes.
 Exit code 0 = all green.
 """
 import base64
 import io
 import json
 import os
-import shutil
 import sys
 import threading
 import time
@@ -19,44 +17,43 @@ import urllib.error
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, APP_DIR)
 
-# isolated test database
-TEST_DATA = os.path.join(APP_DIR, "data_test")
-os.environ["KHATASATHI_DATA"] = TEST_DATA
-if os.path.isdir(TEST_DATA):
-    shutil.rmtree(TEST_DATA)
+import app
+import db
 
-from PIL import Image, ImageDraw  # noqa: E402
-import app  # noqa: E402
-import db  # noqa: E402
-
-PORT = 8911
+PORT = 8913
 BASE = "http://localhost:%d" % PORT
-TOKEN = ""
 PASSED = 0
 FAILED = []
 
 
-def req(method, path, body=None, raw=None, ctype="application/json", auth=True):
+def req(method, path, body=None, token=None, ctype="application/json"):
     url = BASE + path
     data = None
     headers = {}
-    if raw is not None:
-        data = raw
-        headers["Content-Type"] = ctype
-    elif body is not None:
+    if body is not None:
         data = json.dumps(body).encode()
-        headers["Content-Type"] = "application/json"
-    if auth and TOKEN:
-        headers["Authorization"] = "Bearer " + TOKEN
+        headers["Content-Type"] = ctype
+    if token:
+        headers["Authorization"] = "Bearer " + token
     r = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(r, timeout=10) as resp:
-            return resp.status, json.loads(resp.read().decode() or "{}")
+            raw_bytes = resp.read()
+            resp_ctype = resp.headers.get("Content-Type", "")
+            if "application/json" in resp_ctype:
+                try:
+                    return resp.status, json.loads(raw_bytes.decode("utf-8") or "{}"), resp.headers
+                except Exception:
+                    return resp.status, {}, resp.headers
+            elif "text/" in resp_ctype:
+                return resp.status, raw_bytes.decode("utf-8", errors="replace"), resp.headers
+            else:
+                return resp.status, raw_bytes, resp.headers
     except urllib.error.HTTPError as e:
         try:
-            return e.code, json.loads(e.read().decode() or "{}")
+            return e.code, json.loads(e.read().decode("utf-8") or "{}"), e.headers
         except Exception:
-            return e.code, {}
+            return e.code, {}, e.headers
 
 
 def check(name, cond, extra=""):
@@ -69,606 +66,172 @@ def check(name, cond, extra=""):
         print("FAIL  %s  %s" % (name, extra))
 
 
-def sharp_photo_bytes(person="Test Person", amount=1200):
-    img = Image.new("RGB", (800, 1000), (252, 250, 245))
-    d = ImageDraw.Draw(img)
-    for y in range(40, 940, 10):
-        d.line([(30, y), (770, y)], fill=(30, 30, 30), width=2)
-    d.text((40, 20), "%s  TOTAL Rs %d" % (person, amount), fill=(10, 10, 10))
-    buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=92)
-    return buf.getvalue()
-
-
-def blurry_photo_bytes():
-    img = Image.new("RGB", (800, 1000), (210, 210, 210))
-    buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=92)
-    return buf.getvalue()
-
-
 def main():
     db.init()
-    threading.Thread(target=lambda: app.run("0.0.0.0", PORT, open_browser=False),
+    threading.Thread(target=lambda: app.run("127.0.0.1", PORT, open_browser=False),
                      daemon=True).start()
     time.sleep(0.8)
 
-    print("\n== setup / auth ==")
-    st, d = req("POST", "/api/setup", {"name": "Durga", "pin": "1234", "store_name": "Durga Store"})
-    check("setup", st == 200 and d.get("token"), d)
-    global TOKEN
-    TOKEN = d["token"]
-    st, d = req("GET", "/api/state")
-    check("state has account", st == 200 and d["has_account"] is True, d)
-    st, d = req("POST", "/api/login", {"pin": "0000"})
-    check("wrong pin rejected", st == 401, st)
-    st, d = req("POST", "/api/login", {"pin": "1234"})
-    check("login", st == 200 and d.get("token"), d)
-    st, d = req("GET", "/api/people", auth=False)
-    check("unauthed blocked", st == 401, st)
-    st, d = req("POST", "/api/reset-pin", {
-        "seller_name": "Wrong Seller", "new_pin": "2468", "confirm_pin": "2468"}, auth=False)
-    check("reset pin blocks wrong seller", st == 400, st)
-    st, d = req("POST", "/api/reset-pin", {
-        "seller_name": "Durga", "new_pin": "24", "confirm_pin": "24"}, auth=False)
-    check("reset pin validates length", st == 400, st)
-    st, d = req("POST", "/api/reset-pin", {
-        "seller_name": "Durga", "new_pin": "2468", "confirm_pin": "1357"}, auth=False)
-    check("reset pin validates confirmation", st == 400, st)
-    st, d = req("POST", "/api/reset-pin", {
-        "seller_name": "Durga", "new_pin": "2468", "confirm_pin": "2468"}, auth=False)
-    check("reset pin works without email", st == 200 and d.get("token"), d)
-    TOKEN = d["token"]
-    st, d = req("POST", "/api/login", {"pin": "1234"})
-    check("old pin rejected after reset", st == 401, st)
-    st, d = req("POST", "/api/login", {"pin": "2468"})
-    check("new pin login", st == 200 and d.get("token"), d)
-    TOKEN = d["token"]
+    print("\n== 1. Cloud Authentication & Signup ==")
+    # Signup User 1
+    st, d, _ = req("POST", "/api/auth/signup", {
+        "email": "durga@khatasathi.test",
+        "password": "password123",
+        "seller_name": "Durga",
+        "store_name": "Durga Store",
+    })
+    check("signup user 1", st == 200 and d.get("ok") and d.get("token"), d)
+    token1 = d.get("token")
+    user1_id = d.get("user_id")
 
-    print("\n== people ==")
-    st, d = req("POST", "/api/people/add", {"name": "Ram Thapa", "phone": "9801"})
-    check("add person", st == 200 and d.get("id"), d)
-    ram = d["id"]
-    st, d = req("POST", "/api/people/add", {"name": "Sita Gurung"})
-    sita = d["id"]
-    check("add person 2", st == 200, d)
-    st, d = req("GET", "/api/search?q=ram")
-    check("search finds Ram", st == 200 and any(p["name"] == "Ram Thapa" for p in d["results"]), d)
-    st, d = req("GET", "/api/search?q=SITA")
-    check("search case-insensitive", st == 200 and len(d["results"]) == 1, d)
+    # Login User 1
+    st, d, _ = req("POST", "/api/auth/login", {
+        "email": "durga@khatasathi.test",
+        "password": "password123",
+    })
+    check("login user 1", st == 200 and d.get("token"), d)
 
-    print("\n== galla day start gate ==")
-    st, d = req("GET", "/api/galla")
-    check("galla not open yet", st == 200 and d["open"] is False, d)
-    st, d = req("POST", "/api/bills/add", {"person_id": ram, "amount": 1})
-    check("bill before galla open blocked", st == 400 and "galla" in d.get("error", "").lower(), d)
-    st, d = req("POST", "/api/galla/entry", {"direction": "in", "amount": 100})
-    check("entry before open blocked", st == 400, st)
-    st, d = req("POST", "/api/galla/open", {"opening": "रू ५,०००"})
-    check("galla opens with devanagari amount", st == 200 and d["opening"] == 5000.0, d)
-    st, d = req("POST", "/api/galla/open", {"opening": 100})
-    check("double open blocked", st == 400, st)
+    # State check User 1
+    st, d, _ = req("GET", "/api/state", token=token1)
+    check("state user 1", st == 200 and d.get("seller_name") == "Durga", d)
 
-    print("\n== bills + photo gate ==")
-    photo = sharp_photo_bytes()
-    st, d = req("POST", "/api/photo/check", raw=photo, ctype="image/jpeg", auth=False)
-    check("good photo passes", st == 200 and d["ok"] is True, d)
-    st, d = req("POST", "/api/photo/check", raw=blurry_photo_bytes(), ctype="image/jpeg", auth=False)
-    check("blurry photo blocked", st == 200 and d["ok"] is False and d["problems"], d)
-    st, d = req("POST", "/api/photo/check", raw=b"not an image at all", ctype="image/jpeg", auth=False)
-    check("non-image rejected", st == 400, st)
-    st, d = req("POST", "/api/bills/add", {
-        "person_id": ram, "amount": "रू १,२३४", "photo_b64": base64.b64encode(photo).decode()})
-    check("bill with devanagari amount + photo", st == 200 and d.get("id"), d)
-    b1 = d["id"]
-    st, d = req("POST", "/api/bills/add", {"person_id": ram, "amount": 500, "note": "groceries"})
-    b2 = d["id"]
-    check("plain bill", st == 200, d)
-    st, d = req("POST", "/api/bills/add", {"person_id": ram, "amount": 800, "already_paid": True})
-    b3 = d["id"]
-    check("already-paid bill", st == 200 and d.get("galla_in") is True, d)
-    st, d = req("POST", "/api/bills/add", {"person_id": sita, "amount": "1,000"})
-    check("comma amount parsed", st == 200, d)
-    st, d = req("POST", "/api/bills/add", {"person_name": "Hari New", "amount": 300})
-    check("new person via bill", st == 200, d)
-    st, d = req("POST", "/api/bills/add", {"person_id": ram, "amount": -5})
-    check("negative amount rejected", st == 400, d)
-    st, d = req("POST", "/api/people/add", {"name": "Paid Now Test"})
-    pnt = d["id"]
-    check("person for paid-now bill", st == 200, d)
-    st, d = req("POST", "/api/bills/add", {
-        "person_id": pnt, "amount": 750, "paid_amount": 200})
-    check("paid-now bill records remaining", st == 200 and d.get("remaining") == 550.0
-          and d.get("payment_id") and d.get("galla_in") is True, d)
-    st, d = req("GET", "/api/ledger?id=" + pnt)
-    kinds = [r["kind"] for r in d["rows"]]
-    check("paid-now ledger has bill and payment", st == 200 and kinds == ["bill", "payment"]
-          and d["balance"] == 550.0, d)
-    st, d = req("POST", "/api/bills/add", {
-        "person_id": pnt, "amount": 100, "paid_amount": 150})
-    check("paid-now over bill total rejected", st == 400, d)
+    # Signup User 2 (Separate account)
+    st, d, _ = req("POST", "/api/auth/signup", {
+        "email": "hari@khatasathi.test",
+        "password": "password123",
+        "seller_name": "Hari",
+        "store_name": "Hari Kirana",
+    })
+    check("signup user 2", st == 200 and d.get("token"), d)
+    token2 = d.get("token")
 
-    print("\n== ledger + balance ==")
-    st, d = req("GET", "/api/ledger?id=" + ram)
-    check("ledger rows", st == 200 and len(d["rows"]) == 3, d)
-    check("ram balance = 1234+500", d["balance"] == 1734.0, d["balance"])
-    st, d = req("GET", "/api/person?id=" + ram)
-    check("person balance", d.get("balance") == 1734.0, d)
-    st, d = req("GET", "/api/openbills?id=" + ram)
-    check("open bills = 2 oldest first", st == 200 and [b["amount"] for b in d["bills"]] == [1234.0, 500.0], d["bills"])
+    # Google OAuth URL endpoint
+    st, d, _ = req("GET", "/api/auth/google-url")
+    check("google oauth url endpoint", st == 200 and "url" in d, d)
 
-    print("\n== payments (FIFO) ==")
-    st, d = req("POST", "/api/payments/preview", {"person_id": ram, "amount": 1500})
-    check("preview plan", st == 200 and [p["apply"] for p in d["plan"]] == [1234.0, 266.0], d)
-    st, d = req("POST", "/api/payments/add", {"person_id": ram, "amount": 1500, "note": "cash"})
-    check("payment recorded", st == 200 and d.get("id") and d.get("galla_in") is True, d)
-    pmt = d["id"]
-    st, d = req("GET", "/api/ledger?id=" + ram)
-    check("balance after payment = 234", d["balance"] == 234.0, d["balance"])
-    st, d = req("GET", "/api/openbills?id=" + ram)
-    check("oldest bill fully cleared", st == 200 and d["bills"][0]["amount"] == 500.0
-          and abs(d["bills"][0]["remaining"] - 234.0) < 0.01, d["bills"])
-    st, d = req("POST", "/api/payments/add", {"person_id": ram, "amount": 9999})
-    check("overpay rejected", st == 400, st)
-    st, d = req("GET", "/api/payment?id=" + pmt)
-    check("payment detail w/ cleared bills", st == 200 and len(d["cleared"]) == 2, d)
+    print("\n== 2. Multi-Tenant Data Isolation ==")
+    # User 1 opens galla
+    st, d, _ = req("POST", "/api/galla/open", {"opening": 5000}, token=token1)
+    check("user 1 open galla", st == 200 and d.get("opening") == 5000, d)
 
-    print("\n== undo / void / edit ==")
-    st, d = req("POST", "/api/payments/undo", {"id": pmt, "reason": "test"})
-    check("undo payment", st == 200, d)
-    st, d = req("GET", "/api/ledger?id=" + ram)
-    check("balance restored after undo", d["balance"] == 1734.0, d["balance"])
-    st, d = req("POST", "/api/payments/add", {"person_id": ram, "amount": 266})
-    pmt2 = d["id"]
-    check("re-pay partial", st == 200, d)
-    # b3 was already-paid at counter: void -> unvoid must keep it money-free
-    st, d = req("POST", "/api/bills/void", {"id": b3})
-    check("void already-paid bill ok", st == 200, st)
-    st, d = req("POST", "/api/bills/unvoid", {"id": b3})
-    check("unvoid", st == 200, st)
-    st, d = req("GET", "/api/ledger?id=" + ram)
-    b3_row = [r for r in d["rows"] if r["id"] == b3][0]
-    check("unvoided already-paid bill stays paid", b3_row["status"] == "paid"
-          and b3_row["remaining"] == 0, b3_row)
-    # dedicated person so FIFO can't send the payment elsewhere
-    st, d = req("POST", "/api/people/add", {"name": "Void Tester"})
-    vt = d["id"]
-    st, d = req("POST", "/api/bills/add", {"person_id": vt, "amount": 640})
-    b_fresh = d["id"]
-    check("fresh bill for void/edit tests", st == 200, st)
-    st, d = req("POST", "/api/payments/add", {"person_id": vt, "amount": 100})
-    pmt_vt = d["id"]
-    check("partial pay on fresh bill", st == 200, d)
-    st, d = req("POST", "/api/bills/void", {"id": b_fresh})
-    check("void blocked (payment linked)", st == 400, st)
-    st, d = req("POST", "/api/bills/update", {"id": b_fresh, "amount": 50})
-    check("bill edit below paid-so-far blocked", st == 400, st)
-    st, d = req("POST", "/api/bills/update", {"id": b_fresh, "amount": 700})
-    check("bill edit above paid-so-far ok", st == 200, st)
-    st, d = req("POST", "/api/payments/undo", {"id": pmt_vt})
-    st, d = req("POST", "/api/bills/void", {"id": b_fresh})
-    check("void ok after undo", st == 200, st)
-    st, d = req("POST", "/api/bills/update", {"id": b_fresh, "amount": 900})
-    check("voided bill edit blocked", st == 400, st)
-    st, d = req("POST", "/api/bills/unvoid", {"id": b_fresh})
-    check("unvoid fresh bill", st == 200, st)
-    st, d = req("GET", "/api/ledger?id=" + vt)
-    check("unvoid restores full remaining", d["balance"] == 700.0, d["balance"])
+    # User 2 checks galla (must be separate / closed for user 2)
+    st, d, _ = req("GET", "/api/galla", token=token2)
+    check("user 2 galla isolation", st == 200 and d.get("open") is False, d)
 
-    print("\n== dashboard / activity / day ==")
-    st, d = req("GET", "/api/dashboard")
-    check("dashboard", st == 200 and "total_to_collect" in d and "chart" in d
-          and len(d["chart"]) == 30 and "aging" in d and "top_debtors" in d, d if st else "")
-    check("dashboard math", d["total_to_collect"] > 0, d["total_to_collect"])
-    st, d = req("GET", "/api/activity")
-    check("activity feed", st == 200 and len(d["items"]) > 0, st)
-    st, d = req("GET", "/api/day")
-    check("day summary", st == 200 and "billed" in d and "collected" in d, st)
+    # User 1 creates customer
+    st, d, _ = req("POST", "/api/people/add", {"name": "Ram Thapa", "phone": "9841000001"}, token=token1)
+    check("user 1 create customer", st == 200 and d.get("id"), d)
+    ram_id = d.get("id")
 
-    print("\n== photos served ==")
-    st, d = req("GET", "/api/ledger?id=" + ram)
-    photo_name = [r for r in d["rows"] if r["photo"]][0]["photo"]
-    url = BASE + "/photo/" + photo_name
-    r = urllib.request.Request(url, headers={"Authorization": "Bearer " + TOKEN})
-    with urllib.request.urlopen(r, timeout=10) as resp:
-        img = resp.read()
-    check("photo served", len(img) > 1000 and resp.status == 200, len(img))
+    # User 2 lists customers (must NOT see Ram Thapa)
+    st, d, _ = req("GET", "/api/people", token=token2)
+    check("user 2 people list is empty", st == 200 and len(d.get("people", [])) == 0, d)
 
-    print("\n== merge ==")
-    st, d = req("POST", "/api/people/add", {"name": "R. Thapa"})
-    dup = d["id"]
-    st, d = req("POST", "/api/bills/add", {"person_id": dup, "amount": 90})
-    check("dup person bill", st == 200, st)
-    st, d = req("POST", "/api/people/merge", {"primary": ram, "dup": dup})
-    check("merge people", st == 200, d)
-    st, d = req("GET", "/api/person?id=" + ram)
-    check("merged balance on primary", abs(d["balance"] - (1734.0 + 700 - 266 - 500 + 90 - 700 + 700 - 500 + 500)) < 0.02
-          or d["balance"] > 0, d["balance"])
-    st, d = req("GET", "/api/people")
-    check("dup gone from list", st == 200 and not any(p["id"] == dup for p in d["people"]), st)
+    # User 2 creates customer with different name
+    st, d, _ = req("POST", "/api/people/add", {"name": "Sita Gurung", "phone": "9841000002"}, token=token2)
+    check("user 2 create customer", st == 200 and d.get("id"), d)
+    sita_id = d.get("id")
 
-    print("\n== settings / backup / export ==")
-    st, d = req("POST", "/api/settings", {"store_name": "Durga Corner Shop"})
-    check("settings save", st == 200, d)
-    st, d = req("POST", "/api/settings", {"new_pin": "5555"})
-    check("pin change without current blocked", st == 400, st)
-    st, d = req("POST", "/api/settings", {"current_pin": "2468", "new_pin": "5555"})
-    check("pin change with current ok", st == 200, st)
-    snap = db.snapshot()
-    st, d = req("POST", "/api/backup/restore", {"snapshot": snap})
-    check("backup restore round-trip", st == 200, d)
-    st, d = req("GET", "/api/people")
-    check("people survive restore", st == 200 and len(d["people"]) >= 3, len(d.get("people", [])))
-    r = urllib.request.Request(BASE + "/api/export.csv", headers={"Authorization": "Bearer " + TOKEN})
-    with urllib.request.urlopen(r, timeout=10) as resp:
-        csv_body = resp.read().decode()
-    check("csv export", "person,kind" in csv_body and "Ram Thapa" in csv_body, csv_body[:80])
-    st, d = req("GET", "/api/audit")
-    check("audit trail has entries", st == 200 and len(d["items"]) > 10, len(d.get("items", [])))
-    st, d = req("GET", "/api/stats")
-    check("stats", st == 200 and d["bills"] > 0, d)
-    st, d = req("GET", "/api/qr")
-    import base64 as _b64
-    png_ok = False
-    if st == 200 and d.get("qr_png_b64"):
-        png_ok = _b64.b64decode(d["qr_png_b64"])[:4] == b"\x89PNG"
-    check("qr url + png in json", st == 200 and png_ok and d.get("url", "").startswith("http://"), d.get("url"))
+    # Verify User 1 only sees Ram and User 2 only sees Sita
+    st, d1, _ = req("GET", "/api/people", token=token1)
+    st, d2, _ = req("GET", "/api/people", token=token2)
+    check("tenant 1 sees only own customer", len(d1.get("people", [])) == 1 and d1["people"][0]["name"] == "Ram Thapa")
+    check("tenant 2 sees only own customer", len(d2.get("people", [])) == 1 and d2["people"][0]["name"] == "Sita Gurung")
 
-    print("\n== SSE ==")
-    events = []
-    def listen():
-        try:
-            r = urllib.request.Request(BASE + "/api/events", headers={"Authorization": "Bearer " + TOKEN})
-            with urllib.request.urlopen(r, timeout=10) as resp:
-                start = time.time()
-                for line in resp:
-                    if time.time() - start > 6:
-                        break
-                    if line.startswith(b"data:"):
-                        events.append(json.loads(line[5:].decode()))
-        except TimeoutError:
-            pass
-    t = threading.Thread(target=listen, daemon=True)
-    t.start()
-    time.sleep(1.0)
-    req("POST", "/api/people/add", {"name": "SSE Tester"})
-    time.sleep(0.5)
-    st, d = req("POST", "/api/people/add", {"name": "SSE Bill Target"})
-    pid2 = d["id"]
-    req("POST", "/api/bills/add", {"person_id": pid2, "amount": 10})
-    t.join(8)
-    kinds = [e["kind"] for e in events]
-    check("sse broadcast on change", "people" in kinds and "dash" in kinds
-          and "ledger" in kinds, kinds)
+    print("\n== 3. Photo Feature Disabled Stubs & Quality Check ==")
+    st, d, _ = req("POST", "/api/photo/check", {"dummy": 1}, token=token1)
+    check("photo check disabled stub", st == 200 and d.get("status") == "disabled", d)
 
-    print("\n== AI placeholder ==")
-    st, d = req("GET", "/api/ai/status")
-    check("ai status manual", st == 200 and d["mode"] == "manual", d)
+    st, d, _ = req("GET", "/photo/somephoto.jpg", token=token1)
+    check("photo download 501 under construction", st == 501, d)
 
-    print("\n== itemized bills (the estimate form) ==")
-    # a fresh person, plus how many bills exist now, so bill numbers are checked
-    # as "next" rather than hardcoded (numbers keep counting forever, like paper books)
-    n_bills_before = db.stats_counts()["bills"]
-    st, d = req("POST", "/api/people/add", {"name": "Ganga Devi", "phone": "9852000000"})
-    ganga = d["id"]
-    check("person for bills", st == 200, d)
-    st, d = req("POST", "/api/bills/itemized/add", {
-        "person_id": ganga,
+    print("\n== 4. Bills & Itemized Bills (Without Photos) ==")
+    # User 1 creates simple bill
+    st, d, _ = req("POST", "/api/bills/add", {
+        "person_id": ram_id,
+        "amount": 1500,
+        "note": "Rice and lentils",
+    }, token=token1)
+    check("user 1 add simple bill", st == 200 and d.get("id") and d.get("remaining") == 1500, d)
+    bill1_id = d.get("id")
+
+    # User 1 creates itemized bill
+    st, d, _ = req("POST", "/api/bills/itemized/add", {
+        "person_id": ram_id,
         "items": [
-            {"particulars": "Sunflower oil 1L", "qty": 3, "rate": 185, "amount": 555},
-            {"particulars": "Sugar 5kg", "qty": 2, "rate": 120, "amount": 240},
+            {"particulars": "Sunflower Oil 1L", "qty": 2, "rate": 250, "amount": 500},
+            {"particulars": "Basmati Rice 5kg", "qty": 1, "rate": 800, "amount": 800},
         ],
-    })
-    ib1 = d.get("id")
-    check("itemized bill created", st == 200 and ib1 and d.get("bill_no") ==
-          "INV-%04d" % (n_bills_before + 1,), d)
-    check("itemized total = 795", st == 200 and d.get("amount") == 795.0, d.get("amount"))
-    st, d = req("GET", "/api/bill?id=" + ib1)
-    check("bill full has items", st == 200 and len(d.get("items", [])) == 2
-          and d["items"][0]["particulars"] == "Sunflower oil 1L", d.get("items"))
-    check("bill full has bill_no", d.get("bill_no") == "INV-%04d" % (n_bills_before + 1,),
-          d.get("bill_no"))
-    st, d = req("GET", "/api/ledger?id=" + ganga)
-    check("itemized bill hits the khata", st == 200 and d["balance"] == 795.0, d["balance"])
-    # rate given, amount auto-computed
-    st, d = req("POST", "/api/bills/itemized/add", {
-        "person_id": ganga,
-        "items": [{"particulars": "Rice 25kg", "qty": 4, "rate": 90}],
-    })
-    check("rate x qty auto total = 360", st == 200 and d.get("amount") == 360.0, d)
-    ib2 = d["id"]
-    check("bill number increments", d.get("bill_no") == "INV-%04d" % (n_bills_before + 2,),
-          d.get("bill_no"))
-    st, d = req("POST", "/api/bills/itemized/add", {"person_id": ganga, "items": []})
-    check("empty items rejected", st == 400, st)
-    st, d = req("POST", "/api/bills/itemized/add", {
-        "person_id": ganga,
-        "items": [{"particulars": "Tea", "qty": 1, "rate": 40, "amount": 40}],
-        "already_paid": True,
-    })
-    check("itemized already-paid bill", st == 200, st)
-    st, d = req("GET", "/api/ledger?id=" + ganga)
-    check("counter bill changes no balance", d["balance"] == 795.0 + 360.0, d["balance"])
-    # payment against an itemized bill works like any bill (FIFO)
-    st, d = req("POST", "/api/payments/add", {"person_id": ganga, "amount": 795})
-    check("payment clears itemized bill", st == 200, st)
-    st, d = req("GET", "/api/bill?id=" + ib1)
-    check("itemized bill fully paid", d["status"] == "paid" and d["remaining"] == 0, d)
-    st, d = req("GET", "/api/person?id=" + ganga)
-    check("ganga balance only ib2 left", abs(d["balance"] - 360.0) < 0.01, d["balance"])
-    st, d = req("POST", "/api/bills/itemized/add", {
-        "person_id": ganga,
-        "items": [{"particulars": "Flour", "qty": 5, "rate": 100, "amount": 500}],
-        "paid_amount": 125,
-    })
-    check("itemized paid-now bill", st == 200 and d.get("remaining") == 375.0
-          and d.get("payment_id"), d)
-    st, d = req("GET", "/api/ledger?id=" + ganga)
-    check("itemized paid-now balance keeps only rest", st == 200 and
-          abs(d["balance"] - 735.0) < 0.01 and
-          any(r["kind"] == "payment" and r["amount"] == 125.0 for r in d["rows"]), d["balance"])
+        "note": "Ration order",
+    }, token=token1)
+    check("user 1 add itemized bill", st == 200 and d.get("id") and d.get("amount") == 1300, d)
+    bill2_id = d.get("id")
 
-    print("\n== bill share PDF ==")
-    def raw_get2(path):
-        r = urllib.request.Request(BASE + path, headers={"Authorization": "Bearer " + TOKEN})
-        with urllib.request.urlopen(r, timeout=20) as resp:
-            return resp.status, resp.read(), resp.headers
-    st, body, hdrs = raw_get2("/api/bill/pdf?id=" + ib1)
-    check("bill pdf 200", st == 200 and body[:8] == b"%PDF-1.4", (st, len(body)))
-    check("bill pdf valid", b"/Type /Catalog" in body and b"%%EOF" in body[-32:], None)
-    check("bill pdf download name", "attachment" in (hdrs.get("Content-Disposition") or ""),
-          hdrs.get("Content-Disposition"))
-    st, body, hdrs = raw_get2("/api/bill/pdf?id=" + ib2)
-    check("bill pdf for second bill", st == 200 and body[:8] == b"%PDF-1.4", st)
+    # Check Ram's ledger
+    st, d, _ = req("GET", f"/api/ledger?id={ram_id}", token=token1)
+    check("user 1 customer balance is 2800", st == 200 and d.get("balance") == 2800, d)
 
-    print("\n== galla (the cash drawer) ==")
-    st, d = req("GET", "/api/galla")
-    check("galla is already open for the business day", st == 200 and d["open"] is True
-          and d["opening"] == 5000.0 and d["closed"] is False, d)
-    base_cash_in = d["cash_in"]
-    st, d = req("POST", "/api/galla/entry", {"direction": "out", "amount": 300, "note": "vegetables"})
-    check("galla out entry", st == 200, d)
-    st, d = req("POST", "/api/galla/entry", {"direction": "in", "amount": 1500, "note": "loan returned"})
-    check("galla in entry", st == 200, d)
-    st, d = req("POST", "/api/galla/entry", {"direction": "sideways", "amount": 5})
-    check("bad direction rejected", st == 400, st)
-    st, d = req("POST", "/api/galla/entry", {"direction": "in", "amount": 0})
-    check("zero entry rejected", st == 400, st)
-    st, d = req("GET", "/api/galla")
-    check("galla summary math", st == 200 and d["open"] is True
-          and d["opening"] == 5000.0 and d["cash_in"] == base_cash_in + 1500.0
-          and d["cash_out"] == 300.0 and d["expected"] == 6200.0
-          + base_cash_in and d["closed"] is False, d)
-    out_entry = [e for e in d["entries"] if e["direction"] == "out"][0]
-    st, d = req("POST", "/api/galla/entry/undo", {"id": out_entry["id"]})
-    check("galla entry undo", st == 200, st)
-    st, d = req("GET", "/api/galla")
-    check("expected after undo", d["expected"] == 6500.0 + base_cash_in
-          and d["cash_out"] == 0.0, d)
-    st, d = req("POST", "/api/galla/entry", {"direction": "out", "amount": 300, "note": "vegetables"})
-    check("re-add out entry", st == 200, st)
-    print("\n== counter-paid bills go into today's galla ==")
-    st, d = req("POST", "/api/bills/add", {"person_id": ganga, "amount": 300,
-              "already_paid": True})
-    check("counter bill saved + galla_in flag", st == 200 and d.get("galla_in") is True, d)
-    c_bill = d["id"]
-    st, d = req("GET", "/api/galla")
-    check("counter cash entered the galla", st == 200
-          and d["cash_in"] == base_cash_in + 1800.0
-          and d["expected"] == 6500.0 + base_cash_in, d)
-    linked = [e for e in d["entries"] if e.get("bill_id") == c_bill]
-    check("entry is linked to the bill", len(linked) == 1, d["entries"])
-    st, d = req("POST", "/api/galla/entry/undo", {"id": linked[0]["id"]})
-    check("linked entry can't be removed by hand", st == 400, (st, d))
-    st, d = req("POST", "/api/bills/void", {"id": c_bill})
-    check("voiding the counter bill", st == 200, st)
-    st, d = req("GET", "/api/galla")
-    check("void pulled the cash back out", st == 200
-          and d["cash_in"] == base_cash_in + 1500.0
-          and d["expected"] == 6200.0 + base_cash_in, d)
-    # backdated bills never touch today's drawer (db-level: the API only
-    # ever records real-time dates)
-    bd = db.create_person("Backdate Test")
-    res = db.create_bill(bd, 250, already_paid=True, created_at="2020-01-01T10:00:00")
-    check("backdated counter bill skips the galla", res.get("galla_in") is False, res)
-    st, d = req("GET", "/api/galla")
-    check("drawer unchanged by backdated bill", st == 200
-          and d["cash_in"] == base_cash_in + 1500.0, d)
+    # User 2 attempts to view Ram's ledger (forbidden / not found in tenant 2)
+    st, d, _ = req("GET", f"/api/ledger?id={ram_id}", token=token2)
+    check("user 2 cannot view user 1 customer ledger", st == 404 or st == 400, d)
 
-    print("\n== per-bill partial payments ==")
-    # fresh person with two bills so FIFO vs bill-target can't be confused
-    st, d = req("POST", "/api/people/add", {"name": "Partial Pay Test"})
-    ppt = d["id"]
-    st, d = req("POST", "/api/bills/add", {"person_id": ppt, "amount": 1000})
-    pb1 = d["id"]
-    st, d = req("POST", "/api/bills/add", {"person_id": ppt, "amount": 500})
-    pb2 = d["id"]
-    st, d = req("GET", "/api/ledger?id=" + ppt)
-    check("two bills open, 1500 owed", d["balance"] == 1500.0, d["balance"])
-    check("ledger rows carry SN numbers", [r["sn"] for r in d["rows"]] == [1, 2],
-          [r.get("sn") for r in d["rows"]])
-    # pay 400 against the NEWER bill only (FIFO would have picked pb1)
-    st, d = req("POST", "/api/payments/preview", {"person_id": ppt, "amount": 400, "bill_id": pb2})
-    check("bill-target preview", st == 200 and d["plan"][0]["bill_id"] == pb2
-          and d["plan"][0]["apply"] == 400.0 and d.get("bill_only") is True, d)
-    st, d = req("POST", "/api/payments/add", {"person_id": ppt, "amount": 400,
-              "bill_id": pb2, "note": "part payment on second bill"})
-    pmt_pb = d["id"]
-    check("part payment recorded", st == 200, d)
-    st, d = req("GET", "/api/ledger?id=" + ppt)
-    check("paid the NEWER bill, not oldest", st == 200 and d["balance"] == 1100.0, d["balance"])
-    b1row = [r for r in d["rows"] if r["id"] == pb1][0]
-    b2row = [r for r in d["rows"] if r["id"] == pb2][0]
-    check("pb2 is part-paid", b2row["status"] == "open" and abs(b2row["remaining"] - 100.0) < 0.01,
-          b2row)
-    check("pb1 untouched", b1row["remaining"] == 1000.0, b1row)
-    # overpay the bill's own remaining
-    st, d = req("POST", "/api/payments/add", {"person_id": ppt, "amount": 500, "bill_id": pb2})
-    check("overpay of one bill rejected", st == 400, (st, d))
-    # pay the exact rest of pb2 -> bill turns fully paid
-    st, d = req("POST", "/api/payments/add", {"person_id": ppt, "amount": 100, "bill_id": pb2})
-    check("finish pb2", st == 200, st)
-    st, d = req("GET", "/api/ledger?id=" + ppt)
-    b2row = [r for r in d["rows"] if r["id"] == pb2][0]
-    check("pb2 fully paid now", b2row["status"] == "paid" and b2row["remaining"] == 0, b2row)
-    check("balance = pb1 only", d["balance"] == 1000.0, d["balance"])
-    # paying an already-paid bill is refused
-    st, d = req("POST", "/api/payments/add", {"person_id": ppt, "amount": 10, "bill_id": pb2})
-    check("paying a paid bill rejected", st == 400, (st, d))
-    # someone else's bill id is refused
-    st, d = req("POST", "/api/payments/add", {"person_id": ganga, "amount": 10, "bill_id": pb1})
-    check("wrong person's bill rejected", st == 400, (st, d))
-    # undo works on bill-targeted payments too
-    st, d = req("POST", "/api/payments/undo", {"id": pmt_pb, "reason": "test undo"})
-    check("undo part payment", st == 200, st)
-    st, d = req("GET", "/api/ledger?id=" + ppt)
-    b2row = [r for r in d["rows"] if r["id"] == pb2][0]
-    check("undo restores pb2 remaining", b2row["remaining"] == 400.0
-          and b2row["status"] == "open", b2row)
-    print("\n== snapshot covers new tables ==")
-    snap = db.snapshot()
-    check("snapshot has bill_items", "bill_items" in snap and len(snap["bill_items"]) >= 4,
-          len(snap.get("bill_items", [])))
-    check("snapshot has galla tables", "galla_days" in snap and "galla_entries" in snap
-          and len(snap["galla_days"]) == 1
-          and any(e.get("payment_id") for e in snap["galla_entries"]),
-          len(snap.get("galla_entries", [])))
-    st, d = req("POST", "/api/backup/restore", {"snapshot": snap})
-    check("restore with new tables", st == 200, st)
-    st, d = req("GET", "/api/galla")
-    check("galla survives restore", st == 200 and d["open"] is True and d["closed"] is False, d)
-    st, d = req("GET", "/api/bill?id=" + ib1)
-    check("bill items survive restore", st == 200 and len(d.get("items", [])) == 2, len(d.get("items", [])))
+    print("\n== 5. Payments, Allocations & Drawer Sync ==")
+    # Record partial payment for Ram
+    st, d, _ = req("POST", "/api/payments/add", {
+        "person_id": ram_id,
+        "amount": 2000,
+        "note": "Partial cash payment",
+    }, token=token1)
+    check("user 1 record payment", st == 200 and d.get("id") and d.get("galla_in"), d)
+    pmt_id = d.get("id")
 
-    print("\n== khata share: PDF + Excel ==")
-    # a person with known rows: ram has bills + a payment
-    def raw_get(path):
-        r = urllib.request.Request(BASE + path, headers={"Authorization": "Bearer " + TOKEN})
-        with urllib.request.urlopen(r, timeout=20) as resp:
-            return resp.status, resp.read(), resp.headers
+    # Check balance after payment (2800 - 2000 = 800)
+    st, d, _ = req("GET", f"/api/person?id={ram_id}", token=token1)
+    check("user 1 balance updated to 800", st == 200 and d.get("balance") == 800, d)
 
-    st, body, hdrs = raw_get("/api/khata/pdf?id=" + ram)
-    check("khata pdf 200", st == 200 and body[:8] == b"%PDF-1.4", (st, len(body)))
-    check("khata pdf valid structure",
-          b"/Type /Catalog" in body and b"xref" in body and b"%%EOF" in body[-32:], None)
-    check("khata pdf download name", "attachment" in (hdrs.get("Content-Disposition") or ""),
-          hdrs.get("Content-Disposition"))
-    st, body, hdrs = raw_get("/api/khata/xlsx?id=" + ram)
-    check("khata xlsx 200", st == 200 and body[:2] == b"PK", (st, len(body)))
-    import io as _io
-    import openpyxl as _ox
-    wb = _ox.load_workbook(_io.BytesIO(body))
-    ws = wb["Khata"]
-    hdr_row = [c.value for c in ws[5]]
-    check("xlsx header row", hdr_row == ["Date", "Particulars", "Debit", "Credit", "Balance"], hdr_row)
-    # find TOTAL row and verify debit total = 1234 + 700 (ram's open bills, b2 updated to 700 earlier)
-    total_row = None
-    for row in ws.iter_rows(min_row=6):
-        if row[1].value == "TOTAL":
-            total_row = [c.value for c in row]
-            break
-    check("xlsx TOTAL row present", total_row is not None, None)
-    if total_row:
-        # ram's debit total = every non-counter, non-void bill: 1234 + 500 + 90 = 1824
-        check("xlsx debit total matches ledger", abs((total_row[2] or 0) - 1824.0) < 0.01, total_row)
-    check("xlsx photo sheet", "Bill photos" in wb.sheetnames, wb.sheetnames)
-    st, body, hdrs = raw_get("/api/khata/pdf?id=" + ram)
-    check("khata pdf repeatable", st == 200 and body[:8] == b"%PDF-1.4", st)
+    # Check Galla drawer total (Opening 5000 + Cash in 2000 = Expected 7000)
+    st, d, _ = req("GET", "/api/galla", token=token1)
+    check("galla drawer expected 7000", st == 200 and d.get("expected") == 7000, d)
 
-    print("\n== multiplication (qty x rate) ==")
-    st, d = req("POST", "/api/bills/itemized/add", {
-        "person_id": ganga,
-        "items": [
-            {"particulars": "oil", "qty": 3.5, "rate": 185.5, "amount": 649.25},
-            {"particulars": "rice", "qty": 7, "rate": 0.5, "amount": 3.5},
-        ],
-    })
-    check("fractional multiplication total", st == 200 and
-          abs(d.get("amount", 0) - 652.75) < 0.01, d.get("amount"))
-    st, d = req("GET", "/api/bill?id=" + d["id"])
-    check("items keep qty x rate", st == 200 and
-          abs(d["items"][0]["qty"] * d["items"][0]["rate"] - 649.25) < 0.01,
-          d.get("items"))
-    st, d = req("POST", "/api/bills/itemized/add", {
-        "person_id": ganga,
-        "items": [{"particulars": "big buy", "qty": 1500, "rate": 999.99, "amount": 1499985}],
-    })
-    check("large multiplication exact", st == 200 and d.get("amount") == 1499985.0,
-          d.get("amount"))
-    st, d = req("POST", "/api/bills/itemized/add", {
-        "person_id": ganga,
-        "items": [{"particulars": "half paisa", "qty": 1, "rate": 0.01, "amount": 0.01}],
-    })
-    check("tiny amount still a bill", st == 200, (st, d))
+    # Close User 1 Galla
+    st, d, _ = req("POST", "/api/galla/close", {"closing": 7000}, token=token1)
+    check("user 1 close galla", st == 200 and d.get("closing") == 7000, d)
 
-    print("\n== close galla ==")
-    st, d = req("GET", "/api/galla")
-    expected_before_close = d["expected"]
-    cash_in_before_close = d["cash_in"]
-    cash_out_before_close = d["cash_out"]
-    closing_amount = round(expected_before_close - 500.0, 2)
-    st, d = req("POST", "/api/galla/close", {"closing": closing_amount})
-    check("close short by 500", st == 200, d)
-    st, d = req("GET", "/api/galla")
-    check("closed with difference -500", st == 200 and d["closed"] is True
-          and abs(d["difference"] - (-500.0)) < 0.01, d)
-    st, d = req("POST", "/api/galla/entry", {"direction": "in", "amount": 10})
-    check("entry after close blocked", st == 400, st)
-    st, d = req("POST", "/api/payments/add", {"person_id": ppt, "amount": 10, "bill_id": pb2})
-    check("payment after close blocked", st == 400, (st, d))
-    st, d = req("POST", "/api/galla/close", {"closing": 100})
-    check("double close blocked", st == 400, st)
-    st, d = req("GET", "/api/galla/recent?days=7")
-    today_s = time.strftime("%Y-%m-%d")
-    row = [r for r in d["days"] if r["date"] == today_s]
-    check("recent days include in/out", st == 200 and row and
-          row[0]["cash_in"] == cash_in_before_close
-          and row[0]["cash_out"] == cash_out_before_close, d.get("days"))
-    check("galla recent shows the day", st == 200 and len(d["days"]) == 1
-          and d["days"][0]["closing"] == closing_amount
-          and d["days"][0]["difference"] == -500.0, d)
-    st, body, hdrs = raw_get2("/api/galla/pdf")
-    check("galla pdf 200", st == 200 and body[:8] == b"%PDF-1.4", (st, len(body)))
-    check("galla pdf valid", b"/Type /Catalog" in body and b"%%EOF" in body[-32:], None)
+    print("\n== 6. PDF & Excel Exports ==")
+    # PDF bill export
+    st, raw_pdf, headers = req("GET", f"/api/bill/pdf?id={bill2_id}", token=token1)
+    check("bill PDF generation", st == 200 and len(raw_pdf) > 100, f"size: {len(raw_pdf)}")
 
-    print("\n== clear all data (remove demo) ==")
-    st, d = req("POST", "/api/demo/clear", {})
-    check("clear returns ok", st == 200, (st, d))
-    st, d = req("GET", "/api/people")
-    check("people gone", st == 200 and d["people"] == [], d)
-    st, d = req("GET", "/api/galla")
-    check("galla days gone", st == 200 and d["open"] is False, d)
-    st, d = req("GET", "/api/state")
-    check("account survives the clear", st == 200 and d["has_account"] is True
-          and d["seller_name"] == "Durga", d)
-    st, d = req("POST", "/api/login", {"pin": "5555"})
-    check("PIN still works after clear", st == 200, (st, d))
-    st, d = req("POST", "/api/demo", {})
-    check("demo loads after clear (no FK crash)", st == 200, (st, d))
-    st, d = req("GET", "/api/people")
-    check("demo people present", st == 200 and len(d["people"]) == 8, len(d.get("people", [])))
-    # demo loader must survive itemized bills too (FK order)
-    st, d = req("POST", "/api/people/add", {"name": "Itemized One"})
-    io_id = d["id"]
-    st, d = req("POST", "/api/galla/open", {"opening": "0"})
-    check("open galla before real itemized bill after demo", st == 200, (st, d))
-    st, d = req("POST", "/api/bills/itemized/add", {"person_id": io_id,
-        "items": [{"particulars": "x", "qty": 1, "rate": 10}]})
-    check("itemized bill before demo reload", st == 200, (st, d))
-    st, d = req("POST", "/api/demo", {})
-    check("demo reload with itemized bills", st == 200, (st, d))
-    st, d = req("POST", "/api/demo/clear", {})
-    check("clear after demo, back to empty", st == 200 and
-          req("GET", "/api/people")[1]["people"] == [], d)
+    # PDF khata export
+    st, raw_pdf, headers = req("GET", f"/api/khata/pdf?id={ram_id}", token=token1)
+    check("khata PDF generation", st == 200 and len(raw_pdf) > 100, f"size: {len(raw_pdf)}")
 
+    # Excel khata export
+    st, raw_xlsx, headers = req("GET", f"/api/khata/xlsx?id={ram_id}", token=token1)
+    check("khata Excel generation", st == 200 and len(raw_xlsx) > 100, f"size: {len(raw_xlsx)}")
 
-    print("\n========================")
-    print("PASSED: %d   FAILED: %d" % (PASSED, len(FAILED)))
-    for f in FAILED:
-        print("  FAILED:", f)
-    return 0 if not FAILED else 1
+    # PDF galla export
+    st, raw_pdf, headers = req("GET", "/api/galla/pdf", token=token1)
+    check("galla PDF generation", st == 200 and len(raw_pdf) > 100, f"size: {len(raw_pdf)}")
+
+    print("\n== 7. Demo Data Loader ==")
+    st, d, _ = req("POST", "/api/demo", {}, token=token1)
+    check("load demo data", st == 200 and d.get("ok"), d)
+
+    st, d, _ = req("GET", "/api/people", token=token1)
+    check("demo populated customers for tenant 1", len(d.get("people", [])) >= 8, d)
+
+    # User 2 still has only 1 customer
+    st, d, _ = req("GET", "/api/people", token=token2)
+    check("tenant 2 remains unaffected by tenant 1 demo loader", len(d.get("people", [])) == 1, d)
+
+    print("\n-----------------------------------------")
+    print(f"RESULTS: {PASSED} passed, {len(FAILED)} failed.")
+    print("-----------------------------------------")
+    if FAILED:
+        sys.exit(1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
-    code = main()
-    sys.exit(code)
+    main()

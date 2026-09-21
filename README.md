@@ -1,110 +1,124 @@
-# Khata Sathi
+# Khata Sathi (Cloud Edition)
 
-**Your bills, your khata — one place.**
+**Your bills, your khata — completely cloud-hosted.**
 
-The shop's credit notebook (khata), but the bills arrive as photos. Snap a bill on
-the phone, it lands on the laptop instantly, every person gets a ledger, and every
-rupee of a balance traces back to the bill photo it came from.
+Khata Sathi is a cloud-native credit notebook (khata) and receipt management application designed for production on **Vercel** with **PostgreSQL** and **Supabase Auth / Google OAuth**.
+
+After deploying, you can **turn off your laptop** and access Khata Sathi from any phone, laptop, or tablet worldwide via your custom domain or Vercel URL.
 
 ---
 
-## Start it (the whole install)
+## Production Cloud Architecture
 
-Double-click **`KhataSathi.bat`**. That's it.
+```
+                      My Custom Domain (e.g. https://mydomain.com)
+                                            |
+                                            v
+                                     Vercel Edge CDN
+                                     /             \
+                   Frontend (PWA/SPA)               Python Serverless API
+                                                            |
+                                        +-------------------+-------------------+
+                                        |                                       |
+                                        v                                       v
+                             PostgreSQL Database                       Supabase Auth & Storage
+                         (Neon.tech or Supabase)                      (Google OAuth + Storage)
+                     All business data & audit trail                 Multi-tenant user identity
+```
 
-- The laptop app opens in your browser at `http://localhost:8787`
-- First run asks your name + a 4-8 digit PIN (that's the only account — buyers never need one)
-- The console window shows the phone address; **Connect phone** (top-right QR icon) shows a QR to scan with the phone camera. Both must be on the same Wi-Fi.
-- On the phone: open the address → browser menu → **Add to Home Screen** → it becomes an app.
+---
 
-To stop: close the console window. Your data is safe (see below).
+## Complete Step-by-Step Cloud Setup & Deployment Guide
 
-## What's where
+### Step 1: Create a Free PostgreSQL Database on Supabase (or Neon)
+1. Go to [Supabase](https://supabase.com) and create a free account.
+2. Click **New Project**, name it (e.g. `khata-sathi`), choose your region, and set a database password.
+3. Once the project is ready, go to **Project Settings → Database**.
+4. Under **Connection string**, select **URI** and choose **Transaction Pooler (Port 6543)** (ideal for serverless Vercel).
+5. Copy this URL (replace `[YOUR-PASSWORD]` with your database password). This is your `DATABASE_URL`.
 
-| File | What it is |
-|---|---|
-| `KhataSathi.bat` | Double-click to start |
-| `data/` | **Everything you own** — database, photos, in one folder. Copy this folder = full backup. |
-| `web/` | The app itself (phone + laptop faces) |
-| `app.py`, `db.py`, `photos.py`, `demo.py` | The server — plain Python, no install needed |
-| `test_api.py` | 158 automated tests: `python test_api.py` |
+---
 
-Requires: Python 3.10+ with Pillow + qrcode (`pip install pillow qrcode`). Nothing else.
+### Step 2: Configure Google Sign-In & Supabase Auth
 
-## The 30-second tour
+#### A. Google Cloud Console (OAuth Credentials)
+1. Go to [Google Cloud Console](https://console.cloud.google.com/).
+2. Create a new project or select an existing one.
+3. Navigate to **APIs & Services → OAuth consent screen**:
+   - User Type: **External**
+   - App Name: `Khata Sathi`
+   - User Support Email: Your email
+   - Developer Contact Info: Your email
+   - Save and continue through Scopes (default `email`, `profile`, `openid` are sufficient).
+4. Navigate to **APIs & Services → Credentials**:
+   - Click **Create Credentials → OAuth client ID**.
+   - Application type: **Web application**.
+   - Name: `Khata Sathi Web Client`.
+   - **Authorized redirect URIs**: Add your Supabase callback URL:
+     `https://<YOUR-PROJECT-REF>.supabase.co/auth/v1/callback`
+     *(Find your Project Reference ID under Supabase Project Settings → General)*.
+   - Click **Create**.
+   - Copy the **Client ID** and **Client Secret**.
 
-1. **Add bill** (phone or laptop): take the bill photo — Khata Sathi checks it itself
-   (too dark / blurry / tiny → it asks you to retake, in plain words). Type the name
-   (existing people pop up as suggestions), type the amount — **Devanagari digits
-   (रू १,२३४) convert automatically** — and check the photo beside the numbers before saving.
-2. New name → new account, automatically. Old name → a new line in their **khata**.
-3. **Got money**: type how much came in. Before saving, Khata Sathi shows exactly which
-   bills get cleared — oldest first. Partial payments fine.
-4. **Ledger** (nav): every person on the left, their full khata on the right →
-   **S.N. / Date / Particulars / Debit / Credit / Remaining**, totals, share as PDF /
-   Excel / text, print. Same numbers as the paper notebook.
-5. Click anyone's balance → the open bills behind it, each with its photo and days owed.
-6. **Dashboard** (laptop): total to collect, today's in/out, 30-day chart, aging of owed
-   money, biggest balances, latest activity.
-7. What happens on the phone appears on the laptop **by itself** — no refresh, ever.
+#### B. Enable Google in Supabase
+1. In your Supabase dashboard, go to **Authentication → Providers**.
+2. Click **Google**, toggle it **Enabled**.
+3. Paste the **Client ID** and **Client Secret** obtained from Google Cloud Console.
+4. Under **Authentication → URL Configuration**:
+   - **Site URL**: Your production domain or Vercel URL (e.g. `https://your-app.vercel.app`).
+   - **Redirect URLs**: Add `https://your-app.vercel.app` and `http://localhost:8000` (for local dev).
+5. Go to **Project Settings → API**:
+   - Copy the **Project URL** (`SUPABASE_URL`).
+   - Copy the **anon public key** (`SUPABASE_ANON_KEY`).
 
-## The खाता — a real paper ledger on screen
+---
 
-Every person's ledger is drawn like the actual khata notebook, on both the phone and
-the laptop:
+### Step 3: Deploy to Vercel
 
-- Columns exactly like the paper: **मिति Date · विवरण Particulars · डेबिट Debit ·
-  क्रेडिट Credit · बाँकी Balance**, with a red margin line down the date column.
-- **Debit** = credit you gave (a bill). **Credit** = money that came in (a payment, or a
-  bill paid at the counter). Balance = what they still owe after that line.
-- The bottom of the page has the **जम्मा totals row** (total debit, total credit,
-  balance) and the grand balance in big letters.
-- Every bill line keeps its photo thumbnail (tap to enlarge) and status pill
-  (open / part-paid / paid / counter / void).
-- Tap a bill line → the **complete credit** of that bill: full amount, every payment
-  applied against it, and what's still open.
-- **Print** button (top right) prints the khata on paper — it prints just the ledger,
-  nothing else, ready to pin in the shop.
-- **Statement** button gives the same khata as copy-paste text for WhatsApp.
+1. Push your code to GitHub / GitLab / Bitbucket.
+2. Go to [Vercel](https://vercel.com) and click **Add New → Project**.
+3. Import your Khata Sathi repository.
+4. Under **Environment Variables**, add the following:
+   - `DATABASE_URL`: `postgresql://postgres:[PASSWORD]@db.[REF].supabase.co:6543/postgres?sslmode=require`
+   - `SESSION_SECRET`: A secure random 32+ character string (e.g. `openssl rand -hex 32`)
+   - `SUPABASE_URL`: `https://[REF].supabase.co`
+   - `SUPABASE_ANON_KEY`: Your Supabase anon public key
+5. Click **Deploy**.
 
-## Money rules (the important ones)
+---
 
-- **The confirm screen is the law.** Nothing saves without a human tap.
-- Open today's **Galla** before entering bills or payments. This keeps the
-  day book, khata, and drawer in one flow.
-- A bill photo too bad to read later → Khata Sathi asks for a retake **before** accepting it.
-- Payments clear the **oldest bills first**, and the payment record says which.
-- **Pay one bill**: open a bill from the ledger, tap **Pay this bill**, pay any part of it.
-  The bill shows part-paid, then paid when finished. Every payment also lands in
-  today's galla; overpaying that one bill is refused, and undo works like any payment.
-- Undo a payment → balances come back exactly; the bills it cleared reopen.
-- Void a bill only if no payment is linked (undo the payment first).
-- "Already paid at counter" or "paid now" on a bill → the cash is added to
-  today's galla automatically. Void/undo the source and it comes back out of the drawer.
-- Every change lands in the **audit trail** (Settings) — nothing vanishes silently.
-- Names in Nepali (Devanagari) or English both work everywhere, including search.
-- One-tap **statement** per person — copy-paste and send.
-- **Backup** (Settings) = one file with everything; **Restore** puts it back.
-  **Export CSV** opens in Excel.
-- Demo shop in Settings to explore safely (replaces data — it warns first). **Remove all data** (Settings) takes the shop back to empty
-  while keeping your account and PIN.
+### Step 4: (Optional) Connect Your Custom Domain
+In Vercel Dashboard → **Settings → Domains**, enter your custom domain (e.g., `khata.yourshop.com`) and configure the DNS CNAME/A records as guided by Vercel.
 
-## Two faces, one app
+**Your laptop can now be turned off completely.** The application runs 24/7 in the cloud.
 
-- **Laptop** = brain: dashboard, day-end totals, settings, everything.
-- **Phone** = camera + quick lists: big Add button, people with balances, record payment.
-- Both update live over the shop Wi-Fi (same address, QR connect).
+---
 
-## Where AI will go (v1.5, not built yet)
+## Multi-Tenant Security & Privacy
 
-Settings → Bill reading already has its seat reserved: **Mode: Manual (default, never
-removed) / AI** — and under AI, **Local (offline) / API (cloud)**. Manual stays as the
-fallback if AI fails or reads badly. The confirm screen stays identical in all modes,
-so plugging AI in changes nothing you see.
+Every single database record (customers, bills, payments, cash drawer entries, settings) is tied to a unique `user_id`. When any user logs in (via Email or Google OAuth):
+- The server extracts and cryptographically verifies their Supabase JWT / session token.
+- All database queries strictly enforce `WHERE user_id = %s`.
+- Account A cannot access, view, modify, or export any data belonging to Account B.
 
-## If something goes wrong
+---
 
-- **Port busy** → Khata Sathi picks the next free port automatically; the console shows the real address.
-- **Phone can't connect** → both devices must be on the same Wi-Fi; check the QR address again.
-- **"Cannot reach the server"** → start `KhataSathi.bat` again; data is on disk, never lost by a restart.
-- **Forgot PIN** → click **Reset PIN** on the PIN screen. No email is sent; type the seller name saved on this laptop and choose a new 4-8 digit PIN.
+## Free-Tier Limits & Transparency
+
+| Provider | Free Tier Limits | Credit Card Required? | What happens when limit is reached? |
+| :--- | :--- | :--- | :--- |
+| **Vercel** | 100 GB bandwidth/month, Serverless Functions, Free Custom SSL | **No** | Soft notification |
+| **Supabase** | 500 MB PostgreSQL DB, 50,000 Monthly Active Users, 1 GB Storage | **No** | Warning notification |
+| **Neon** | 0.5 GB PostgreSQL DB, autoscaling scale-to-zero | **No** | Compute scales down when idle |
+
+---
+
+## Features
+
+- **Google OAuth & Email Auth**: One-click Google sign-in and secure email/password registration with password recovery.
+- **Strict Multi-Tenant Isolation**: Total data separation across business accounts.
+- **Stateless Serverless Execution**: Zero local disk dependencies; safe for Vercel's read-only serverless filesystem.
+- **Itemized Billing & FIFO Ledgers**: Automatically tracks line items, partial payments, and debit/credit balances.
+- **Cash Drawer (Galla)**: Opening and closing cash flow tracking linked to transactions.
+- **PDF & Excel Exports**: Direct cloud generation of customer statements, bills, and drawer reports.
+

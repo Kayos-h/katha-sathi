@@ -1,19 +1,32 @@
-# Customer data — never upload (real khata records, photos, backups)
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+
+# Vercel build output
+.vercel
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# Legacy local data (do not commit to production)
 data/
 data_test/
+*.db
+*.sqlite
+*.sqlite3
 
-# Python
-__pycache__/
-*.pyc
-
-# Test artifacts / scratch
-test_out.*
+# Test outputs
+test_out.pdf
+test_out.xlsx
 gui-test-screenshots/
-pdf_page1.jpg
 
-# Machine-specific deploy config
-web/.vercel/
-
-# OS
-Thumbs.db
-Desktop.ini
+.vercel
+.env*

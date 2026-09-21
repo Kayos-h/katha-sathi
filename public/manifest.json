@@ -1,0 +1,12 @@
+{
+  "name": "Khata Sathi",
+  "short_name": "Khata Sathi",
+  "description": "Your bills, your khata - one place.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f2ec",
+  "theme_color": "#4f46e5",
+  "icons": [
+    { "src": "favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

@@ -1,3 +1,5 @@
-Pillow
-qrcode
-openpyxl
+psycopg2-binary>=2.9.9
+Pillow>=10.0.0
+qrcode>=7.4.2
+openpyxl>=3.1.2
+requests>=2.31.0

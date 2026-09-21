@@ -1,0 +1,15 @@
+﻿.git
+.env
+.env.local
+.env.*.local
+.vercel
+__pycache__
+*.pyc
+data
+data_test
+*.db
+*.sqlite
+*.sqlite3
+test_out.pdf
+test_out.xlsx
+gui-test-screenshots

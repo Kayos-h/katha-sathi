@@ -1,10 +1,7 @@
-"""Khata Sathi - photo quality check and photo storage.
+"""Khata Sathi - photo management (Temporarily Disabled / Under Construction).
 
-Photo in -> a verdict (accept / retake) + reasons in plain words.
-No AI: blur = variance of the Laplacian, darkness = mean brightness,
-small = too few pixels. Runs on the laptop when the phone uploads.
-Thresholds are tuned to be a strict gate on the AMOUNT area of a bill:
-if the photo can't be read, the user is told to retake, not to squint.
+Notice: The photo clicking and uploading feature is temporarily disabled for cloud infrastructure upgrade.
+All photo operations operate in-memory or return safe stubs with ZERO local filesystem writes.
 """
 import hashlib
 import io
@@ -17,20 +14,20 @@ try:
 except ImportError:
     HAS_PIL = False
 
-import db
+FEATURE_ENABLED = False
+FEATURE_STATUS_MESSAGE = "Photo feature — Under Construction"
 
 # verdict thresholds
-MIN_LONG_EDGE = 480          # below this, print is unreadable
-MIN_MEAN_BRIGHTNESS = 40     # darker than this = shot in the dark
-MAX_MEAN_BRIGHTNESS = 240    # brighter = blown-out white
-MIN_SHARPNESS = 45.0         # variance of Laplacian; below = blurry
+MIN_LONG_EDGE = 480
+MIN_MEAN_BRIGHTNESS = 40
+MAX_MEAN_BRIGHTNESS = 240
+MIN_SHARPNESS = 45.0
 HISTOGRAM_BINS = 256
-DUP_WINDOW = 5               # seconds of tolerance for duplicate check
+DUP_WINDOW = 5
 
 
 def _laplacian_var(gray):
-    """Variance of the 3x3 Laplacian over a sampled grid - the classic
-    blur metric. Sampled, not full-res, so it stays fast on phones' 12MP shots."""
+    """Variance of the 3x3 Laplacian over a sampled grid - classic blur metric."""
     w, h = gray.size
     small = gray.resize((min(w, 256), min(h, 256)))
     px = small.load()
@@ -51,11 +48,10 @@ def _laplacian_var(gray):
 
 
 def check_quality(data):
-    """Returns (ok, verdict) - verdict is a list of plain-word problems."""
+    """Returns (ok, verdict) - in-memory quality validation."""
     problems = []
     ok = True
     if not HAS_PIL:
-        # No Pillow on this machine: allow but mark quality unknown
         return True, []
     try:
         img = Image.open(io.BytesIO(data))
@@ -83,84 +79,34 @@ def check_quality(data):
     return ok, problems
 
 
-def save_photo(data, ext=".jpg", person_id=None):
-    """Save bytes to the photos folder with a unique name; return filename."""
-    if ext not in (".jpg", ".png", ".webp", ".jpeg"):
-        ext = ".jpg"
-    fname = time.strftime("%Y%m%d%H%M%S") + "-" + db.new_id() + ext
-    path = os.path.join(db.PHOTO_DIR, fname)
-    with open(path, "wb") as fh:
-        fh.write(data)
-    return fname
+def sniff_image(data):
+    """Returns extension if bytes start with JPEG/PNG/WebP magic header, else None."""
+    if not data or len(data) < 12:
+        return None
+    if data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return None
 
 
-def image_fingerprint(data):
-    return hashlib.sha256(data).hexdigest()[:16]
-
-
-def recent_fingerprints(person_id=None):
-    conn = db.connect()
-    rows = conn.execute(
-        "SELECT photo, created_at, person_id FROM bills ORDER BY created_at DESC LIMIT 200"
-    ).fetchall()
-    rows2 = conn.execute(
-        "SELECT photo, created_at, person_id FROM payments ORDER BY created_at DESC LIMIT 100"
-    ).fetchall()
-    conn.close()
-    return [(r["photo"], r["created_at"], r["person_id"]) for r in rows + rows2]
-
-
-def duplicate_check(data, person_id=None):
-    """Same photo already used in the last few entries? Gentle warning."""
-    fp = image_fingerprint(data)
-    recent = recent_fingerprints(person_id)
-    now = time.mktime(time.strptime(db.now_iso(), "%Y-%m-%dT%H:%M:%S"))
-    for photo, at, pid in recent:
-        if not photo:
-            continue
-        path = os.path.join(db.PHOTO_DIR, photo)
-        if not os.path.exists(path):
-            continue
-        try:
-            with open(path, "rb") as fh:
-                old = fh.read()
-        except OSError:
-            continue
-        if image_fingerprint(old) == fp:
-            try:
-                t = time.mktime(time.strptime(at, "%Y-%m-%dT%H:%M:%S"))
-            except ValueError:
-                continue
-            if abs(now - t) < DUP_WINDOW * 86400:
-                return True
+def duplicate_check(data, user_id="default"):
+    """Duplicate checker stub with zero disk operations."""
     return False
 
 
-def photo_path(fname):
-    return os.path.join(db.PHOTO_DIR, os.path.basename(str(fname)))
-
-
-def serve_photo(fname):
-    path = photo_path(fname)
-    if not os.path.isfile(path):
-        return None, None
-    ctype = "image/jpeg"
-    if fname.lower().endswith(".png"):
-        ctype = "image/png"
-    elif fname.lower().endswith(".webp"):
-        ctype = "image/webp"
-    with open(path, "rb") as fh:
-        return fh.read(), ctype
-
-
-# JPEG/PNG SOI sniff - is this even an image?
-def sniff_image(data):
-    if not data or len(data) < 12:
-        return ""
-    if data[0:2] == b"\xff\xd8":
-        return ".jpg"
-    if data[0:8] == b"\x89PNG\r\n\x1a\n":
-        return ".png"
-    if data[0:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return ".webp"
+def save_photo(data, ext=".jpg", user_id="default"):
+    """Photo upload is temporarily under construction; returns empty string."""
     return ""
+
+
+def get_photo_url(fname, user_id="default"):
+    """Returns empty string or placeholder while feature is under construction."""
+    return ""
+
+
+def serve_photo(fname, user_id="default"):
+    """Returns (None, 'image/jpeg') with zero filesystem operations."""
+    return None, "image/jpeg"

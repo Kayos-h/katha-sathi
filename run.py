@@ -1,8 +1,8 @@
-"""Khata Sathi launcher - double-click this (or run: python run.py).
+"""Khata Sathi - Local Development Runner (LEGACY / DEV ONLY).
 
-Starts the server, opens Khata Sathi in your browser, and keeps a
-console window open with the phone address printed. Closing the
-window stops Khata Sathi.
+NOTE: In production, Khata Sathi runs 100% serverlessly on Vercel.
+This file is only used for local offline testing and is NOT required in production.
+Your laptop or server does NOT need to run this command when deployed to Vercel.
 """
 import os
 import sys
@@ -13,17 +13,18 @@ import app  # noqa: E402
 
 
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8787"))
+    print("=" * 60)
+    print("KHATA SATHI - LOCAL DEVELOPMENT SERVER")
+    print("=" * 60)
+    print(f"Running locally at http://localhost:{port}")
+    print("NOTE: Production is hosted on Vercel and does not use this runner.\n")
     try:
-       app.run(
-    host="0.0.0.0",
-    port=int(os.environ.get("PORT", "8787")),
-    open_browser=False
-)
+        app.run(
+            host="0.0.0.0",
+            port=port,
+            open_browser=False
+        )
     except KeyboardInterrupt:
         pass
-    print()
-    print("Khata Sathi stopped. Close this window.")
-    try:
-        input()
-    except EOFError:
-        pass
+    print("\nKhata Sathi local dev server stopped.")
