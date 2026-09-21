@@ -3,8 +3,20 @@
 
 const API = {
   token: localStorage.getItem("bs_token") || "",
+  _cache: new Map(),
 
-  async req(method, path, body, raw, ctype) {
+  clearCache() {
+    this._cache.clear();
+  },
+
+  async req(method, path, body, raw, ctype, bypassCache = false) {
+    if (method === "GET" && !bypassCache && this._cache.has(path)) {
+      const entry = this._cache.get(path);
+      if (Date.now() - entry.time < 15000) {
+        return JSON.parse(JSON.stringify(entry.data));
+      }
+    }
+
     const headers = {};
     if (this.token) headers["Authorization"] = "Bearer " + this.token;
     let payload;
@@ -21,24 +33,33 @@ const API = {
     if (resp.status === 401 && !path.startsWith("/api/auth/") && path !== "/api/login") {
       this.token = "";
       localStorage.removeItem("bs_token");
+      this.clearCache();
       window.dispatchEvent(new CustomEvent("bs-auth-expired"));
       throw new Error("Signed out - please sign in again");
     }
     if (!resp.ok) throw new Error(data.error || ("Error " + resp.status));
+    if (method === "GET" && !path.includes("/api/sync/poll")) {
+      this._cache.set(path, { data, time: Date.now() });
+    }
     return data;
   },
 
-  get(path) { return this.req("GET", path); },
+  get(path, bypassCache = false) { return this.req("GET", path, undefined, undefined, undefined, bypassCache); },
   async post(path, body) {
+    this.clearCache();
     const res = await this.req("POST", path, body);
     setTimeout(() => { if (typeof Live !== "undefined" && Live.pollNow) Live.pollNow(); }, 150);
     return res;
   },
-  postRaw(path, bytes, ctype) { return this.req("POST", path, undefined, bytes, ctype); },
+  postRaw(path, bytes, ctype) {
+    this.clearCache();
+    return this.req("POST", path, undefined, bytes, ctype);
+  },
 
   saveToken(t) {
     this.token = t;
     localStorage.setItem("bs_token", t);
+    this.clearCache();
   },
 };
 
@@ -59,6 +80,7 @@ const Live = {
     try {
       const res = await API.get("/api/sync/poll?since=" + this.lastId);
       if (res && res.events && res.events.length > 0) {
+        API.clearCache();
         res.events.forEach((ev) => {
           if (ev.id > this.lastId) this.lastId = ev.id;
           (this.handlers[ev.kind] || []).forEach((fn) => {

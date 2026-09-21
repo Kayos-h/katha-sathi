@@ -790,3 +790,36 @@ html[data-theme="dark"] .khata-table td.sn-col { color: #b3a88e; }
   .modal-overlay { padding: 0 10px; align-items: end; }
   .modal-foot { padding-bottom: max(12px, env(safe-area-inset-bottom)); }
 }
+
+/* ---------- Touch optimizations & fluid responsiveness ---------- */
+html, body, button, a, input, select, textarea, .nav-item, .bn-item, .person-card, .lrow, .lh-person, .btn, .icon-btn {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+@media (max-width: 768px) {
+  .galla-tabs { flex-wrap: wrap; }
+  .galla-tabs .btn { flex: 1; min-width: 140px; justify-content: center; }
+  .gr-table th, .gr-table td { padding: 8px 6px; font-size: 12px; }
+  .kpi-card .k-value, .kpi-card .kpi-val { font-size: 20px; }
+  .topbar { padding: 0 10px; }
+  .topbar-title { font-size: 15px; }
+  .view-head { gap: 8px; margin-bottom: 12px; }
+  .view-title { font-size: 18px; }
+}
+
+@media (max-width: 480px) {
+  .main { padding: 10px 10px calc(80px + env(safe-area-inset-bottom)); }
+  .panel-pad { padding: 12px 14px; }
+  .dash-grid { gap: 10px; }
+  .people-tools .input { max-width: 100%; }
+  .people-tools .seg { width: 100%; margin-left: 0; }
+  .seg-btn { flex: 1; text-align: center; }
+}
+
