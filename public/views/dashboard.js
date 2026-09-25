@@ -42,10 +42,25 @@ const Dashboard = {
     let html = "";
 
     /* KPI cards */
-    html += kpi("Total to collect", fmtMoney(d.total_to_collect), d.people_open + " people owing", "wallet", "indigo");
-    html += kpi("Collected today", fmtMoney(today.collected), today.n_payments + " payments" + (today.collected_counter ? " + " + fmtMoney(today.collected_counter) + " paid at counter" : ""), "money", "green");
-    html += kpi("Billed today", fmtMoney(today.billed), today.n_bills + " bills", "bill", "amber");
-    html += kpi("People", String(d.total_people), d.open_count + " open bills", "people", "red");
+    html += kpi("Total to collect", fmtMoney(d.total_to_collect), d.people_open + " people owing", "wallet", "indigo", "ledgerhub");
+    html += kpi("Collected today", fmtMoney(today.collected), today.n_payments + " payments" + (today.collected_counter ? " + " + fmtMoney(today.collected_counter) + " paid at counter" : ""), "money", "green", "galla");
+    html += kpi("Billed today", fmtMoney(today.billed), today.n_bills + " bills", "bill", "amber", "billmaker");
+
+    const inv = d.inventory || { total_items: 0, total_value: 0, low_stock_count: 0, out_of_stock_count: 0 };
+    if (inv.total_items > 0) {
+      html += kpi("Stock Valuation", fmtMoney(inv.total_value), inv.total_items + " products (" + (inv.low_stock_count + inv.out_of_stock_count) + " alert)", "box", "indigo", "inventory");
+    } else {
+      html += kpi("People", String(d.total_people), d.open_count + " open bills", "people", "red", "people");
+    }
+
+    if (inv.low_stock_count > 0 || inv.out_of_stock_count > 0) {
+      html = '<div class="w-span-12" style="grid-column:1/-1">' +
+        '<div class="alert-banner" id="dash-inv-alert">' +
+        '<div style="display:flex;align-items:center;gap:10px">' + ico("warn") +
+        '<span><b>Low Stock Alert:</b> ' + (inv.low_stock_count + inv.out_of_stock_count) + ' products need restocking (' + inv.out_of_stock_count + ' out of stock, ' + inv.low_stock_count + ' low)</span></div>' +
+        '<button class="btn sm" id="dash-inv-btn">Restock Now ›</button>' +
+        '</div></div>' + html;
+    }
 
     /* 30-day chart */
     html += '<div class="panel panel-pad w-span-8" id="chart-panel">' +
@@ -75,6 +90,9 @@ const Dashboard = {
     const grid = main.querySelector("#dash-grid");
     grid.innerHTML = html;
 
+    const invBtn = grid.querySelector("#dash-inv-btn");
+    if (invBtn) invBtn.onclick = () => App.go("inventory", { filter: "low" });
+
     this.renderChart(grid, d.chart);
     this.renderAging(grid, d.aging, d.total_to_collect);
     this.renderDebtors(grid, d.top_debtors);
@@ -86,6 +104,11 @@ const Dashboard = {
     } catch (e) {
       grid.querySelector("#act-list").innerHTML = emptyRow("Nothing yet");
     }
+
+    grid.addEventListener("click", (e) => {
+      const kpiCard = e.target.closest("[data-route]");
+      if (kpiCard) { App.go(kpiCard.getAttribute("data-route")); return; }
+    });
 
     grid.querySelector("#dept-list").addEventListener("click", (e) => {
       const it = e.target.closest("[data-person]");
@@ -158,8 +181,8 @@ const Dashboard = {
   },
 };
 
-function kpi(label, value, foot, icon, color) {
-  return '<div class="panel kpi-card"><div class="k-ico ' + color + '">' + ico(icon) + "</div>" +
+function kpi(label, value, foot, icon, color, route) {
+  return '<div class="panel kpi-card" ' + (route ? 'data-route="' + route + '" style="cursor:pointer"' : '') + '><div class="k-ico ' + color + '">' + ico(icon) + "</div>" +
     '<div class="k-label">' + label + '</div><div class="k-value">' + value + "</div>" +
     '<div class="k-foot">' + foot + "</div></div>";
 }

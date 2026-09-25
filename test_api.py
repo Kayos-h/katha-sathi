@@ -105,6 +105,18 @@ def main():
     check("signup user 2", st == 200 and d.get("token"), d)
     token2 = d.get("token")
 
+    # Admin Quick Login Test
+    st, d, _ = req("POST", "/api/auth/login", {
+        "email": "admin@khatasathi.com",
+        "password": "admin",
+    })
+    check("admin quick login", st == 200 and d.get("token") and d.get("user_id") == "usr_admin_001", d)
+    admin_token = d.get("token")
+
+    # State check Admin
+    st, d, _ = req("GET", "/api/state", token=admin_token)
+    check("admin state check", st == 200 and d.get("seller_name") == "Admin", d)
+
     # Google OAuth URL endpoint
     st, d, _ = req("GET", "/api/auth/google-url")
     check("google oauth url endpoint", st == 200 and "url" in d, d)
@@ -193,11 +205,97 @@ def main():
     st, d, _ = req("GET", "/api/galla", token=token1)
     check("galla drawer expected 7000", st == 200 and d.get("expected") == 7000, d)
 
+    print("\n== 6. Inventory Management & Auto-Deduction Tests ==")
+    # Add inventory items
+    st, d, _ = req("POST", "/api/inventory/add", {
+        "name": "Sunflower Oil 1L",
+        "category": "Oil & Ghee",
+        "sku": "OIL-SUN-1",
+        "buy_price": 200,
+        "sell_price": 250,
+        "stock_qty": 20,
+        "unit": "ltr",
+        "min_stock_alert": 5,
+    }, token=token1)
+    check("create inventory item 1 (Sunflower Oil)", st == 200 and d.get("id"), d)
+    oil_id = d.get("id")
+
+    st, d, _ = req("POST", "/api/inventory/add", {
+        "name": "Basmati Rice 25kg",
+        "category": "Rice & Grains",
+        "sku": "RICE-BAS-25",
+        "buy_price": 1800,
+        "sell_price": 2200,
+        "stock_qty": 4,
+        "unit": "bag",
+        "min_stock_alert": 5,
+    }, token=token1)
+    check("create inventory item 2 (Basmati Rice - Low Stock)", st == 200 and d.get("id"), d)
+    rice_id = d.get("id")
+
+    # List inventory and check metrics
+    st, d, _ = req("GET", "/api/inventory", token=token1)
+    check("list inventory returns 2 items", st == 200 and len(d.get("items", [])) == 2, d)
+
+    # Check search
+    st, d, _ = req("GET", "/api/inventory/search?q=sunflower", token=token1)
+    check("search inventory by name", st == 200 and len(d.get("results", [])) == 1 and d["results"][0]["sku"] == "OIL-SUN-1", d)
+
+    # Check summary
+    st, d, _ = req("GET", "/api/inventory/summary", token=token1)
+    check("inventory summary calculates low stock count", st == 200 and d.get("low_stock_count") == 1 and d.get("total_items") == 2, d)
+
+    # Stock adjustment (Restock rice by +6)
+    st, d, _ = req("POST", "/api/inventory/adjust", {
+        "id": rice_id,
+        "change_qty": 6,
+        "reason": "restock",
+        "note": "Wholesale delivery",
+    }, token=token1)
+    check("adjust stock (+6 bags)", st == 200 and d.get("stock_qty") == 10, d)
+
+    # Item detail with movement history
+    st, d, _ = req("GET", f"/api/inventory/item?id={rice_id}", token=token1)
+    check("get inventory item with logs", st == 200 and len(d.get("logs", [])) == 2 and d.get("stock_qty") == 10, d)
+
+    # Create Itemized Bill selling 3 Sunflower Oil and 2 Basmati Rice
+    st, d, _ = req("POST", "/api/bills/itemized/add", {
+        "person_id": ram_id,
+        "already_paid": False,
+        "items": [
+            {"particulars": "Sunflower Oil 1L", "qty": 3, "rate": 250, "amount": 750},
+            {"particulars": "Basmati Rice 25kg", "qty": 2, "rate": 2200, "amount": 4400},
+        ],
+    }, token=token1)
+    check("create itemized bill with inventory items", st == 200 and d.get("id"), d)
+    inv_bill_id = d.get("id")
+
+    # Verify inventory was automatically decremented: Oil 20 - 3 = 17, Rice 10 - 2 = 8
+    st, d, _ = req("GET", f"/api/inventory/item?id={oil_id}", token=token1)
+    check("oil stock auto-decremented to 17", st == 200 and d.get("stock_qty") == 17, d)
+
+    st, d, _ = req("GET", f"/api/inventory/item?id={rice_id}", token=token1)
+    check("rice stock auto-decremented to 8", st == 200 and d.get("stock_qty") == 8, d)
+
+    # Void the bill and verify stock is restored: Oil -> 20, Rice -> 10
+    st, d, _ = req("POST", "/api/bills/void", {"id": inv_bill_id}, token=token1)
+    check("void bill", st == 200 and d.get("ok"), d)
+
+    st, d, _ = req("GET", f"/api/inventory/item?id={oil_id}", token=token1)
+    check("oil stock restored to 20 on void", st == 200 and d.get("stock_qty") == 20, d)
+
+    st, d, _ = req("GET", f"/api/inventory/item?id={rice_id}", token=token1)
+    check("rice stock restored to 10 on void", st == 200 and d.get("stock_qty") == 10, d)
+
+    # Dashboard inventory metrics
+    st, d, _ = req("GET", "/api/dashboard", token=token1)
+    check("dashboard includes inventory section", st == 200 and "inventory" in d and d["inventory"]["total_items"] == 2, d)
+
     # Close User 1 Galla
     st, d, _ = req("POST", "/api/galla/close", {"closing": 7000}, token=token1)
     check("user 1 close galla", st == 200 and d.get("closing") == 7000, d)
 
-    print("\n== 6. PDF & Excel Exports ==")
+    print("\n== 7. PDF & Excel Exports ==")
     # PDF bill export
     st, raw_pdf, headers = req("GET", f"/api/bill/pdf?id={bill2_id}", token=token1)
     check("bill PDF generation", st == 200 and len(raw_pdf) > 100, f"size: {len(raw_pdf)}")
@@ -214,7 +312,7 @@ def main():
     st, raw_pdf, headers = req("GET", "/api/galla/pdf", token=token1)
     check("galla PDF generation", st == 200 and len(raw_pdf) > 100, f"size: {len(raw_pdf)}")
 
-    print("\n== 7. Demo Data Loader ==")
+    print("\n== 8. Demo Data Loader ==")
     st, d, _ = req("POST", "/api/demo", {}, token=token1)
     check("load demo data", st == 200 and d.get("ok"), d)
 
@@ -229,8 +327,8 @@ def main():
     print(f"RESULTS: {PASSED} passed, {len(FAILED)} failed.")
     print("-----------------------------------------")
     if FAILED:
-        sys.exit(1)
-    sys.exit(0)
+        os._exit(1)
+    os._exit(0)
 
 
 if __name__ == "__main__":

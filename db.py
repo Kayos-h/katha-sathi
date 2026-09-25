@@ -114,11 +114,37 @@ CREATE TABLE IF NOT EXISTS sync_events (
     payload TEXT DEFAULT '{}',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS inventory (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL DEFAULT 'default',
+    name TEXT NOT NULL,
+    sku TEXT DEFAULT '',
+    category TEXT DEFAULT 'General',
+    unit TEXT DEFAULT 'pcs',
+    buy_price DOUBLE PRECISION DEFAULT 0,
+    sell_price DOUBLE PRECISION DEFAULT 0,
+    stock_qty DOUBLE PRECISION DEFAULT 0,
+    min_stock_alert DOUBLE PRECISION DEFAULT 5,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS inventory_logs (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL DEFAULT 'default',
+    item_id TEXT NOT NULL,
+    change_qty DOUBLE PRECISION NOT NULL,
+    final_qty DOUBLE PRECISION NOT NULL,
+    reason TEXT NOT NULL,
+    note TEXT DEFAULT '',
+    reference_id TEXT DEFAULT '',
+    created_at TEXT NOT NULL
+);
 """
 
 TABLES = [
     "settings", "people", "bills", "bill_items", "payments",
-    "payment_allocations", "galla_days", "galla_entries", "audit_log"
+    "payment_allocations", "galla_days", "galla_entries", "audit_log",
+    "inventory", "inventory_logs"
 ]
 
 
@@ -328,23 +354,44 @@ def connect():
 def init():
     """Initializes the database schema if tables do not exist."""
     conn = connect()
-    with conn.cursor() as cur:
-        db_url = get_database_url()
-        if not (db_url and (db_url.startswith("postgresql://") or db_url.startswith("postgres://"))):
-            for stmt in SCHEMA.strip().split(";"):
-                stmt = stmt.strip()
-                if stmt:
+    for stmt in SCHEMA.strip().split(";"):
+        stmt = stmt.strip()
+        if stmt:
+            try:
+                with conn.cursor() as cur:
                     cur.execute(stmt)
-        else:
-            cur.execute(SCHEMA)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_settings_user ON settings(user_id);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_people_user ON people(user_id);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_bills_user_person ON bills(user_id, person_id, status);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_user_person ON payments(user_id, person_id);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_galla_entries_user_date ON galla_entries(user_id, date);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_sync_events_user_id ON sync_events(user_id, id);")
-    conn.commit()
-    conn.close()
+                conn.commit()
+            except Exception as e:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+
+    INDEXES = [
+        "CREATE INDEX IF NOT EXISTS idx_settings_user ON settings(user_id);",
+        "CREATE INDEX IF NOT EXISTS idx_people_user ON people(user_id);",
+        "CREATE INDEX IF NOT EXISTS idx_bills_user_person ON bills(user_id, person_id, status);",
+        "CREATE INDEX IF NOT EXISTS idx_payments_user_person ON payments(user_id, person_id);",
+        "CREATE INDEX IF NOT EXISTS idx_galla_entries_user_date ON galla_entries(user_id, date);",
+        "CREATE INDEX IF NOT EXISTS idx_sync_events_user_id ON sync_events(user_id, id);",
+        "CREATE INDEX IF NOT EXISTS idx_inventory_user_name ON inventory(user_id, name);",
+        "CREATE INDEX IF NOT EXISTS idx_inventory_user_sku ON inventory(user_id, sku);",
+        "CREATE INDEX IF NOT EXISTS idx_inventory_logs_user_item ON inventory_logs(user_id, item_id);",
+    ]
+    for idx_stmt in INDEXES:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(idx_stmt)
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+    try:
+        conn.close()
+    except Exception:
+        pass
 
 
 def new_id():
@@ -803,6 +850,7 @@ def set_bill_void(bid, void=True, user_id="default"):
             conn.close()
             raise ValueError("Bill not found")
         galla_touched = False
+        inv_touched = False
         if void:
             if bill["status"] == "void":
                 conn.close()
@@ -816,6 +864,32 @@ def set_bill_void(bid, void=True, user_id="default"):
                 conn.close()
                 raise ValueError("A payment is linked to this bill. Undo that payment first.")
             cur.execute("UPDATE bills SET status = 'void', remaining = 0 WHERE user_id = %s AND id = %s", (user_id, bid))
+
+            # Restore inventory stock
+            cur.execute("SELECT particulars, qty FROM bill_items WHERE user_id = %s AND bill_id = %s", (user_id, bid))
+            items = cur.fetchall()
+            for it in items:
+                part_name = (it["particulars"] or "").strip()
+                if not part_name:
+                    continue
+                cur.execute(
+                    "SELECT id, stock_qty FROM inventory WHERE user_id = %s AND (LOWER(name) = %s OR LOWER(sku) = %s) LIMIT 1",
+                    (user_id, part_name.lower(), part_name.lower())
+                )
+                inv_match = cur.fetchone()
+                if inv_match:
+                    new_st = f2(inv_match["stock_qty"] + it["qty"])
+                    cur.execute(
+                        "UPDATE inventory SET stock_qty = %s, updated_at = %s WHERE user_id = %s AND id = %s",
+                        (new_st, now_iso(), user_id, inv_match["id"])
+                    )
+                    cur.execute(
+                        "INSERT INTO inventory_logs (id, user_id, item_id, change_qty, final_qty, reason, note, reference_id, created_at)"
+                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        (new_id(), user_id, inv_match["id"], it["qty"], new_st, "return", "Restored from Voided Bill", bid, now_iso())
+                    )
+                    inv_touched = True
+
             if bill["already_paid"]:
                 cur.execute("SELECT * FROM galla_entries WHERE user_id = %s AND bill_id = %s", (user_id, bid))
                 for e in cur.fetchall():
@@ -851,6 +925,32 @@ def set_bill_void(bid, void=True, user_id="default"):
                 "UPDATE bills SET status = %s, remaining = %s WHERE user_id = %s AND id = %s",
                 (status, remaining, user_id, bid),
             )
+
+            # Re-deduct inventory stock
+            cur.execute("SELECT particulars, qty FROM bill_items WHERE user_id = %s AND bill_id = %s", (user_id, bid))
+            items = cur.fetchall()
+            for it in items:
+                part_name = (it["particulars"] or "").strip()
+                if not part_name:
+                    continue
+                cur.execute(
+                    "SELECT id, stock_qty FROM inventory WHERE user_id = %s AND (LOWER(name) = %s OR LOWER(sku) = %s) LIMIT 1",
+                    (user_id, part_name.lower(), part_name.lower())
+                )
+                inv_match = cur.fetchone()
+                if inv_match:
+                    new_st = f2(inv_match["stock_qty"] - it["qty"])
+                    cur.execute(
+                        "UPDATE inventory SET stock_qty = %s, updated_at = %s WHERE user_id = %s AND id = %s",
+                        (new_st, now_iso(), user_id, inv_match["id"])
+                    )
+                    cur.execute(
+                        "INSERT INTO inventory_logs (id, user_id, item_id, change_qty, final_qty, reason, note, reference_id, created_at)"
+                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        (new_id(), user_id, inv_match["id"], -it["qty"], new_st, "sale", "Re-deducted from Unvoided Bill", bid, now_iso())
+                    )
+                    inv_touched = True
+
             if bill["already_paid"] and bill["created_at"][:10] == _today():
                 cur.execute("SELECT name FROM people WHERE user_id = %s AND id = %s", (user_id, bill["person_id"]))
                 person = cur.fetchone()
@@ -867,6 +967,8 @@ def set_bill_void(bid, void=True, user_id="default"):
     conn.close()
     if galla_touched:
         broadcast("galla", {}, user_id=user_id)
+    if inv_touched:
+        broadcast("inventory", {}, user_id=user_id)
     broadcast("ledger", {"person_id": bill["person_id"]}, user_id=user_id)
     broadcast("dash", {}, user_id=user_id)
     broadcast("people", {}, user_id=user_id)
@@ -963,6 +1065,25 @@ def create_itemized_bill(person_id, items, photo="", note="", already_paid=False
                 " VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
                 (new_id(), user_id, bid, c["sn"], c["particulars"], c["qty"], c["rate"], c["amount"]),
             )
+            # Automatic Inventory Deduction
+            part_name = c["particulars"].strip()
+            cur.execute(
+                "SELECT id, stock_qty FROM inventory WHERE user_id = %s AND (LOWER(name) = %s OR LOWER(sku) = %s) LIMIT 1",
+                (user_id, part_name.lower(), part_name.lower())
+            )
+            inv_match = cur.fetchone()
+            if inv_match:
+                new_st = f2(inv_match["stock_qty"] - c["qty"])
+                cur.execute(
+                    "UPDATE inventory SET stock_qty = %s, updated_at = %s WHERE user_id = %s AND id = %s",
+                    (new_st, when, user_id, inv_match["id"])
+                )
+                cur.execute(
+                    "INSERT INTO inventory_logs (id, user_id, item_id, change_qty, final_qty, reason, note, reference_id, created_at)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (new_id(), user_id, inv_match["id"], -c["qty"], new_st, "sale", f"Sold on Bill {bill_no}", bid, when)
+                )
+
         audit(conn, "bill_create", bid, {
             "person_id": person_id, "amount": total, "already_paid": bool(already_paid),
             "paid_amount": paid_amount,
@@ -997,6 +1118,7 @@ def create_itemized_bill(person_id, items, photo="", note="", already_paid=False
     broadcast("ledger", {"person_id": person_id}, user_id=user_id)
     broadcast("dash", {}, user_id=user_id)
     broadcast("people", {}, user_id=user_id)
+    broadcast("inventory", {}, user_id=user_id)
     if galla_entry_id:
         broadcast("galla", {"date": when[:10]}, user_id=user_id)
     galla_in = bool(galla_entry_id)
@@ -1504,6 +1626,16 @@ def dashboard(user_id="default"):
         )
         pmt_days = {r["dt"]: r for r in cur.fetchall()}
 
+        cur.execute(
+            "SELECT COUNT(*) as total_items, "
+            "COALESCE(SUM(stock_qty * buy_price), 0) as inv_val, "
+            "COALESCE(SUM(CASE WHEN stock_qty <= min_stock_alert AND stock_qty > 0 THEN 1 ELSE 0 END), 0) as low_stk, "
+            "COALESCE(SUM(CASE WHEN stock_qty <= 0 THEN 1 ELSE 0 END), 0) as out_stk "
+            "FROM inventory WHERE user_id = %s",
+            (user_id,)
+        )
+        inv_row = cur.fetchone() or {"total_items": 0, "inv_val": 0, "low_stk": 0, "out_stk": 0}
+
     conn.close()
 
     chart = []
@@ -1561,6 +1693,12 @@ def dashboard(user_id="default"):
              "open_count": r["n"]}
             for r in top
         ],
+        "inventory": {
+            "total_items": int(inv_row["total_items"] or 0),
+            "total_value": f2(inv_row["inv_val"] or 0),
+            "low_stock_count": int(inv_row["low_stk"] or 0),
+            "out_of_stock_count": int(inv_row["out_stk"] or 0),
+        },
     }
 
 
@@ -1591,6 +1729,8 @@ def stats_counts(user_id="default"):
         n_people = cur.fetchone()["c"]
         cur.execute("SELECT COUNT(*) as c FROM audit_log WHERE user_id = %s", (user_id,))
         n_audit = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) as c FROM inventory WHERE user_id = %s", (user_id,))
+        n_inv = cur.fetchone()["c"]
         cur.execute(
             "SELECT ("
             "  (SELECT COUNT(*) FROM bills WHERE user_id = %s AND photo IS NOT NULL AND photo != '') +"
@@ -1607,7 +1747,7 @@ def stats_counts(user_id="default"):
     conn.close()
     return {
         "bills": n_bills, "payments": n_pmts, "people": n_people,
-        "photos": n_photos, "audit": n_audit,
+        "photos": n_photos, "audit": n_audit, "inventory": n_inv,
         "db_mb": db_mb,
     }
 
@@ -1867,7 +2007,7 @@ def galla_undo_entry(eid, user_id="default"):
 def clear_data(keep_settings=True, user_id="default"):
     conn = connect()
     with conn.cursor() as cur:
-        for t in ["audit_log", "galla_entries", "galla_days", "payment_allocations",
+        for t in ["audit_log", "inventory_logs", "inventory", "galla_entries", "galla_days", "payment_allocations",
                   "bill_items", "payments", "bills", "people"]:
             cur.execute("DELETE FROM " + t + " WHERE user_id = %s", (user_id,))
         if not keep_settings:
@@ -1878,6 +2018,7 @@ def clear_data(keep_settings=True, user_id="default"):
     conn.close()
     _emit_all(user_id=user_id)
     broadcast("galla", {}, user_id=user_id)
+    broadcast("inventory", {}, user_id=user_id)
     return True
 
 
@@ -1906,13 +2047,13 @@ def restore(data, user_id="default"):
     conn = connect()
     try:
         with conn.cursor() as cur:
-            for t in ["audit_log", "galla_entries", "galla_days", "payment_allocations",
+            for t in ["audit_log", "inventory_logs", "inventory", "galla_entries", "galla_days", "payment_allocations",
                       "bill_items", "payments", "bills", "people", "settings"]:
                 cur.execute("DELETE FROM " + t + " WHERE user_id = %s", (user_id,))
             cur.execute("DELETE FROM sync_events WHERE user_id = %s", (user_id,))
             for t in ["settings", "people", "bills", "bill_items", "payments",
-                      "payment_allocations", "galla_days", "galla_entries", "audit_log"]:
-                for r in data[t]:
+                      "payment_allocations", "galla_days", "galla_entries", "inventory", "inventory_logs", "audit_log"]:
+                for r in data.get(t, []):
                     item_dict = {k: v for k, v in r.items() if k != "seq"}
                     item_dict["user_id"] = user_id
                     cols = list(item_dict.keys())
@@ -1926,4 +2067,317 @@ def restore(data, user_id="default"):
         raise
     conn.close()
     _emit_all(user_id=user_id)
+    broadcast("inventory", {}, user_id=user_id)
     return True
+
+
+# ---------------- inventory management ----------------
+
+def list_inventory(q="", category="", status_filter="", user_id="default"):
+    conn = connect()
+    sql = ("SELECT id, name, sku, category, unit, buy_price, sell_price, "
+           "stock_qty, min_stock_alert, created_at, updated_at "
+           "FROM inventory WHERE user_id = %s")
+    args = [user_id]
+    if q:
+        sql += " AND (name ILIKE %s OR sku ILIKE %s OR category ILIKE %s)"
+        args += ["%" + q + "%", "%" + q + "%", "%" + q + "%"]
+    if category and category.lower() != "all":
+        sql += " AND category = %s"
+        args.append(category)
+    if status_filter == "low":
+        sql += " AND stock_qty <= min_stock_alert AND stock_qty > 0"
+    elif status_filter == "out":
+        sql += " AND stock_qty <= 0"
+    elif status_filter == "in_stock":
+        sql += " AND stock_qty > min_stock_alert"
+    sql += " ORDER BY LOWER(name) ASC, id ASC"
+    with conn.cursor() as cur:
+        cur.execute(sql, args)
+        rows = cur.fetchall()
+    conn.close()
+    return [{
+        "id": r["id"],
+        "name": r["name"],
+        "sku": r["sku"] or "",
+        "category": r["category"] or "General",
+        "unit": r["unit"] or "pcs",
+        "buy_price": f2(r["buy_price"]),
+        "sell_price": f2(r["sell_price"]),
+        "stock_qty": f2(r["stock_qty"]),
+        "min_stock_alert": f2(r["min_stock_alert"]),
+        "stock_value": f2(f2(r["stock_qty"]) * f2(r["buy_price"])),
+        "is_low_stock": f2(r["stock_qty"]) <= f2(r["min_stock_alert"]) and f2(r["stock_qty"]) > 0,
+        "is_out_of_stock": f2(r["stock_qty"]) <= 0,
+        "created_at": r["created_at"],
+        "updated_at": r["updated_at"],
+    } for r in rows]
+
+
+def get_inventory_item(item_id, user_id="default"):
+    conn = connect()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, name, sku, category, unit, buy_price, sell_price, "
+            "stock_qty, min_stock_alert, created_at, updated_at "
+            "FROM inventory WHERE user_id = %s AND id = %s",
+            (user_id, item_id)
+        )
+        row = cur.fetchone()
+        if row is None:
+            conn.close()
+            raise ValueError("Item not found in inventory")
+        cur.execute(
+            "SELECT id, change_qty, final_qty, reason, note, reference_id, created_at "
+            "FROM inventory_logs WHERE user_id = %s AND item_id = %s "
+            "ORDER BY created_at DESC, id DESC LIMIT 50",
+            (user_id, item_id)
+        )
+        logs = cur.fetchall()
+    conn.close()
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "sku": row["sku"] or "",
+        "category": row["category"] or "General",
+        "unit": row["unit"] or "pcs",
+        "buy_price": f2(row["buy_price"]),
+        "sell_price": f2(row["sell_price"]),
+        "stock_qty": f2(row["stock_qty"]),
+        "min_stock_alert": f2(row["min_stock_alert"]),
+        "stock_value": f2(f2(row["stock_qty"]) * f2(row["buy_price"])),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "logs": [{
+            "id": l["id"],
+            "change_qty": f2(l["change_qty"]),
+            "final_qty": f2(l["final_qty"]),
+            "reason": l["reason"],
+            "note": l["note"] or "",
+            "reference_id": l["reference_id"] or "",
+            "created_at": l["created_at"],
+        } for l in logs]
+    }
+
+
+def create_inventory_item(data, user_id="default"):
+    name = str(data.get("name") or "").strip()
+    if not name:
+        raise ValueError("Item name is required")
+    sku = str(data.get("sku") or "").strip()
+    category = str(data.get("category") or "General").strip() or "General"
+    unit = str(data.get("unit") or "pcs").strip() or "pcs"
+    buy_price = f2(data.get("buy_price", 0))
+    sell_price = f2(data.get("sell_price", 0))
+    stock_qty = f2(data.get("stock_qty", 0))
+    min_stock_alert = f2(data.get("min_stock_alert", 5))
+
+    if buy_price < 0 or sell_price < 0 or stock_qty < 0 or min_stock_alert < 0:
+        raise ValueError("Prices and stock counts cannot be negative")
+
+    item_id = new_id()
+    when = now_iso()
+    conn = connect()
+    with conn.cursor() as cur:
+        # Check duplicate name
+        cur.execute("SELECT id FROM inventory WHERE user_id = %s AND LOWER(name) = %s", (user_id, name.lower()))
+        if cur.fetchone() is not None:
+            conn.close()
+            raise ValueError(f"An item named '{name}' already exists")
+
+        cur.execute(
+            "INSERT INTO inventory (id, user_id, name, sku, category, unit, buy_price, sell_price, stock_qty, min_stock_alert, created_at, updated_at)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (item_id, user_id, name, sku, category, unit, buy_price, sell_price, stock_qty, min_stock_alert, when, when)
+        )
+        if stock_qty > 0:
+            cur.execute(
+                "INSERT INTO inventory_logs (id, user_id, item_id, change_qty, final_qty, reason, note, reference_id, created_at)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (new_id(), user_id, item_id, stock_qty, stock_qty, "initial", "Initial stock setup", "", when)
+            )
+        audit(conn, "inventory_create", item_id, {
+            "name": name, "sku": sku, "category": category, "stock_qty": stock_qty,
+            "buy_price": buy_price, "sell_price": sell_price,
+        }, user_id=user_id)
+    conn.commit()
+    conn.close()
+    broadcast("inventory", {"item_id": item_id}, user_id=user_id)
+    broadcast("dash", {}, user_id=user_id)
+    return {"id": item_id, "name": name, "stock_qty": stock_qty}
+
+
+def update_inventory_item(item_id, data, user_id="default"):
+    conn = connect()
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM inventory WHERE user_id = %s AND id = %s", (user_id, item_id))
+        old = cur.fetchone()
+        if old is None:
+            conn.close()
+            raise ValueError("Item not found")
+
+        name = str(data.get("name") or old["name"]).strip()
+        sku = str(data.get("sku") if "sku" in data else (old["sku"] or "")).strip()
+        category = str(data.get("category") if "category" in data else (old["category"] or "General")).strip()
+        unit = str(data.get("unit") if "unit" in data else (old["unit"] or "pcs")).strip()
+        buy_price = f2(data.get("buy_price", old["buy_price"]))
+        sell_price = f2(data.get("sell_price", old["sell_price"]))
+        min_stock_alert = f2(data.get("min_stock_alert", old["min_stock_alert"]))
+
+        if buy_price < 0 or sell_price < 0 or min_stock_alert < 0:
+            conn.close()
+            raise ValueError("Prices and alerts cannot be negative")
+
+        # Check duplicate name if name changed
+        if name.lower() != old["name"].lower():
+            cur.execute("SELECT id FROM inventory WHERE user_id = %s AND LOWER(name) = %s AND id != %s", (user_id, name.lower(), item_id))
+            if cur.fetchone() is not None:
+                conn.close()
+                raise ValueError(f"An item named '{name}' already exists")
+
+        when = now_iso()
+        cur.execute(
+            "UPDATE inventory SET name = %s, sku = %s, category = %s, unit = %s, buy_price = %s, sell_price = %s, min_stock_alert = %s, updated_at = %s "
+            "WHERE user_id = %s AND id = %s",
+            (name, sku, category, unit, buy_price, sell_price, min_stock_alert, when, user_id, item_id)
+        )
+        audit(conn, "inventory_update", item_id, {
+            "before": {"name": old["name"], "buy_price": f2(old["buy_price"]), "sell_price": f2(old["sell_price"])},
+            "after": {"name": name, "buy_price": buy_price, "sell_price": sell_price},
+        }, user_id=user_id)
+    conn.commit()
+    conn.close()
+    broadcast("inventory", {"item_id": item_id}, user_id=user_id)
+    broadcast("dash", {}, user_id=user_id)
+    return {"id": item_id, "name": name}
+
+
+def delete_inventory_item(item_id, user_id="default"):
+    conn = connect()
+    with conn.cursor() as cur:
+        cur.execute("SELECT name FROM inventory WHERE user_id = %s AND id = %s", (user_id, item_id))
+        row = cur.fetchone()
+        if row is None:
+            conn.close()
+            raise ValueError("Item not found")
+        cur.execute("DELETE FROM inventory_logs WHERE user_id = %s AND item_id = %s", (user_id, item_id))
+        cur.execute("DELETE FROM inventory WHERE user_id = %s AND id = %s", (user_id, item_id))
+        audit(conn, "inventory_delete", item_id, {"name": row["name"]}, user_id=user_id)
+    conn.commit()
+    conn.close()
+    broadcast("inventory", {}, user_id=user_id)
+    broadcast("dash", {}, user_id=user_id)
+    return True
+
+
+def adjust_stock(item_id, change_qty, reason="adjustment", note="", reference_id="", user_id="default"):
+    change_qty = f2(change_qty)
+    if change_qty == 0:
+        raise ValueError("Change quantity cannot be zero")
+    conn = connect()
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM inventory WHERE user_id = %s AND id = %s", (user_id, item_id))
+        item = cur.fetchone()
+        if item is None:
+            conn.close()
+            raise ValueError("Item not found")
+
+        current_st = f2(item["stock_qty"])
+        new_st = f2(current_st + change_qty)
+        if new_st < 0:
+            conn.close()
+            raise ValueError(f"Cannot reduce stock below zero (current: {current_st}, change: {change_qty})")
+
+        when = now_iso()
+        cur.execute(
+            "UPDATE inventory SET stock_qty = %s, updated_at = %s WHERE user_id = %s AND id = %s",
+            (new_st, when, user_id, item_id)
+        )
+        cur.execute(
+            "INSERT INTO inventory_logs (id, user_id, item_id, change_qty, final_qty, reason, note, reference_id, created_at)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (new_id(), user_id, item_id, change_qty, new_st, reason or "adjustment", note or "", reference_id or "", when)
+        )
+        audit(conn, "inventory_stock_adjust", item_id, {
+            "name": item["name"], "change": change_qty, "before": current_st,
+            "after": new_st, "reason": reason, "note": note or "",
+        }, user_id=user_id)
+    conn.commit()
+    conn.close()
+    broadcast("inventory", {"item_id": item_id}, user_id=user_id)
+    broadcast("dash", {}, user_id=user_id)
+    return {"id": item_id, "stock_qty": new_st, "change_qty": change_qty}
+
+
+def search_inventory(q="", limit=20, user_id="default"):
+    conn = connect()
+    sql = ("SELECT id, name, sku, category, unit, buy_price, sell_price, stock_qty, min_stock_alert "
+           "FROM inventory WHERE user_id = %s")
+    args = [user_id]
+    if q:
+        sql += " AND (name ILIKE %s OR sku ILIKE %s)"
+        args += ["%" + q + "%", "%" + q + "%"]
+    sql += " ORDER BY LOWER(name) ASC LIMIT %s"
+    args.append(int(limit))
+    with conn.cursor() as cur:
+        cur.execute(sql, args)
+        rows = cur.fetchall()
+    conn.close()
+    return [{
+        "id": r["id"],
+        "name": r["name"],
+        "sku": r["sku"] or "",
+        "category": r["category"] or "General",
+        "unit": r["unit"] or "pcs",
+        "buy_price": f2(r["buy_price"]),
+        "sell_price": f2(r["sell_price"]),
+        "stock_qty": f2(r["stock_qty"]),
+        "min_stock_alert": f2(r["min_stock_alert"]),
+    } for r in rows]
+
+
+def inventory_summary(user_id="default"):
+    conn = connect()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) as total_items, "
+            "COALESCE(SUM(stock_qty * buy_price), 0) as total_buy_val, "
+            "COALESCE(SUM(stock_qty * sell_price), 0) as total_sell_val, "
+            "COALESCE(SUM(stock_qty), 0) as total_units, "
+            "COALESCE(SUM(CASE WHEN stock_qty <= min_stock_alert AND stock_qty > 0 THEN 1 ELSE 0 END), 0) as low_stk, "
+            "COALESCE(SUM(CASE WHEN stock_qty <= 0 THEN 1 ELSE 0 END), 0) as out_stk "
+            "FROM inventory WHERE user_id = %s",
+            (user_id,)
+        )
+        stats = cur.fetchone()
+
+        cur.execute("SELECT DISTINCT category FROM inventory WHERE user_id = %s AND category != '' ORDER BY category", (user_id,))
+        cats = [r["category"] for r in cur.fetchall()]
+
+        cur.execute(
+            "SELECT l.id, l.change_qty, l.final_qty, l.reason, l.note, l.created_at, i.name as item_name, i.unit "
+            "FROM inventory_logs l JOIN inventory i ON i.id = l.item_id AND i.user_id = l.user_id "
+            "WHERE l.user_id = %s ORDER BY l.created_at DESC, l.id DESC LIMIT 20",
+            (user_id,)
+        )
+        recent_logs = cur.fetchall()
+    conn.close()
+    return {
+        "total_items": int(stats["total_items"] or 0),
+        "total_value": f2(stats["total_buy_val"] or 0),
+        "total_sell_value": f2(stats["total_sell_val"] or 0),
+        "total_units": f2(stats["total_units"] or 0),
+        "low_stock_count": int(stats["low_stk"] or 0),
+        "out_of_stock_count": int(stats["out_stk"] or 0),
+        "categories": cats,
+        "recent_movements": [{
+            "id": l["id"],
+            "item_name": l["item_name"],
+            "unit": l["unit"] or "pcs",
+            "change_qty": f2(l["change_qty"]),
+            "final_qty": f2(l["final_qty"]),
+            "reason": l["reason"],
+            "note": l["note"] or "",
+            "created_at": l["created_at"],
+        } for l in recent_logs],
+    }

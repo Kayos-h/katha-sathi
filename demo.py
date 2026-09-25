@@ -57,5 +57,19 @@ def load_demo(user_id="default"):
                     require_galla=False, user_id=user_id,
                 )
 
+    # inventory products
+    sample_inventory = [
+        {"name": "Sunflower Cooking Oil (1L)", "sku": "OIL-SUN-1L", "category": "Groceries", "unit": "ltr", "buy_price": 220.0, "sell_price": 260.0, "stock_qty": 45.0, "min_stock_alert": 10.0},
+        {"name": "Basmati Rice (25kg)", "sku": "RICE-BAS-25K", "category": "Grains", "unit": "bag", "buy_price": 2400.0, "sell_price": 2850.0, "stock_qty": 18.0, "min_stock_alert": 5.0},
+        {"name": "Sugar Refined (1kg)", "sku": "SUG-REF-1K", "category": "Groceries", "unit": "kg", "buy_price": 95.0, "sell_price": 115.0, "stock_qty": 60.0, "min_stock_alert": 15.0},
+        {"name": "Tata Tea Gold (500g)", "sku": "TEA-TAT-500", "category": "Beverages", "unit": "packet", "buy_price": 320.0, "sell_price": 380.0, "stock_qty": 30.0, "min_stock_alert": 8.0},
+        {"name": "Wai Wai Noodles (Box)", "sku": "NDL-WAI-BOX", "category": "Snacks", "unit": "box", "buy_price": 550.0, "sell_price": 600.0, "stock_qty": 12.0, "min_stock_alert": 4.0},
+    ]
+    for item in sample_inventory:
+        try:
+            db.create_inventory_item(item, user_id=user_id)
+        except Exception:
+            pass
+
     db.set_setting("store_name", "Khata Sathi Demo Store", user_id=user_id)
-    return {"people": len(made_people)}
+    return {"people": len(made_people), "inventory": len(sample_inventory)}

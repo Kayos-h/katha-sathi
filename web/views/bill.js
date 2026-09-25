@@ -27,21 +27,20 @@ const AddBill = {
     this.renderRight(main);
   },
 
-  /* ---------- photo side (Under Construction) ---------- */
+  /* ---------- photo / AI side (v2.0 locked) ---------- */
   renderLeft(main) {
     const el = main.querySelector("#ab-left");
     el.innerHTML =
-      '<div class="construction-zone">' +
-      '<div class="cam-ico">' + ico("gear") + "</div>" +
-      '<div style="font-weight:800;font-size:16px;margin-top:4px">Photo feature — Under Construction</div>' +
-      '<div style="font-size:13px;line-height:1.5;max-width:320px;color:var(--ink-2);margin-top:4px">' +
-      'Cloud photo storage is currently being upgraded. Enter bill details on the right to record this bill straight into the khata.' +
-      "</div>" +
-      '<div class="construction-badge">' + ico("clock") + " Arriving Soon</div>" +
-      "</div>" +
-      '<div class="hint" style="margin-top:14px;text-align:center;line-height:1.45">' +
-      "All khata records, ledger calculations, and PDF shares work 100% without photos." +
-      "</div>";
+      '<div class="ai-scanner-card" style="padding:28px 20px;text-align:center">' +
+      '<div class="ai-ico-wrap lg" style="margin:0 auto 14px">' + ico("sparkles") + '</div>' +
+      '<div class="ai-scanner-title" style="font-size:17px">AI Bill Scanner <span class="badge badge-pro">' + ico("lock") + ' v2.0</span></div>' +
+      '<div class="ai-scanner-sub" style="max-width:320px;margin:8px auto 0;font-size:13px;line-height:1.5">' +
+      'Optical Character Recognition & automated line-item extraction with Deep AI Vision will unlock in v2.0.' +
+      '</div>' +
+      '<div class="ai-scanner-badge" style="margin-top:16px">' + ico("clock") + ' Coming in v2.0</div>' +
+      '<div class="hint" style="margin-top:16px;text-align:center;line-height:1.45">' +
+      'All khata records, ledger calculations, inventory sync, and WhatsApp PDF shares work 100% right now.' +
+      '</div></div>';
   },
 
   /* ---------- details side ---------- */

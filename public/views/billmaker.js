@@ -1,32 +1,31 @@
 /* Khata Sathi - bill maker: the estimate form. Items with qty x rate,
-   live total, optional photo of the paper bill, save into the khata,
+   live total, live inventory autocomplete & auto-deduction, save into the khata,
    then share the bill as a PDF over WhatsApp.
    The paper form this mirrors: Brought to / ESTIMATE box / S.N.-PARTICULARS-
    QTY.-RATE-AMOUNT / TOTAL / "Goods once sold..." note. */
 "use strict";
 
 /* global API, ico, fmtMoney, devToAscii, toAmountFloat, escapeHtml, modal, toast,
-   lightbox, debounce, whatsappShare, avatarEl */
+   lightbox, debounce, whatsappShare, avatarEl, promptOpenGalla, App */
 
 const BillMaker = {
   id: "billmaker",
   title: "Make bill",
   icon: "doc",
   personId: null,
-  items: [],          // {particulars, qty, rate, amount}
-  photoFile: null,
-  photoUrl: "",
-  photoBytes: null,
+  items: [],          // {particulars, qty, rate, amount, stockInfo}
+  stockCache: null,
+  stockCacheAt: 0,
+  searchCache: {},
 
   async render(main, params) {
     this.personId = (params && params.person) || null;
-    this.items = [{ particulars: "", qty: 1, rate: "", amount: "" }];
-    this.photoFile = null; this.photoUrl = ""; this.photoBytes = null;
+    this.items = [{ particulars: "", qty: 1, rate: "", amount: "", stockInfo: "" }];
 
     main.innerHTML =
       '<div class="view-head">' +
       '<div><div class="view-title">Make a bill</div>' +
-      '<div class="view-sub">Like the paper estimate form — items, rate, total. Saved straight into the khata.</div></div></div>' +
+      '<div class="view-sub">Like the paper estimate form — items, rate, total. Saved straight into the khata with automated inventory sync.</div></div></div>' +
       '<div class="dash-grid">' +
       '<div class="panel panel-pad w-span-8" id="bm-form"></div>' +
       '<div class="panel panel-pad w-span-4" id="bm-side"></div>' +
@@ -50,10 +49,13 @@ const BillMaker = {
       '<div class="field"><label>Phone (for new people)</label><input class="input" id="bm-phone" placeholder="98… (optional)"></div>' +
       '<div class="field"><label>Date</label><input class="input" id="bm-date" type="date"></div>' +
       "</div>" +
-      '<table class="bm-table"><thead><tr>' +
+      '<div style="overflow-x:auto"><table class="bm-table"><thead><tr>' +
       "<th>S.N.</th><th>PARTICULARS</th><th>QTY.</th><th>RATE</th><th>AMOUNT</th><th></th>" +
-      "</tr></thead><tbody id='bm-rows'>" + rowsHtml + "</tbody></table>" +
-      '<button class="btn" id="bm-add-row" style="margin-top:10px">' + ico("plus") + "Add item</button>";
+      "</tr></thead><tbody id='bm-rows'>" + rowsHtml + "</tbody></table></div>" +
+      '<div style="display:flex;align-items:center;gap:10px;margin-top:12px;flex-wrap:wrap">' +
+      '<button class="btn" id="bm-add-row">' + ico("plus") + "Add empty item</button>" +
+      '<button class="btn primary" id="bm-pick-stock">' + ico("box") + "<span>Pick from Stock (Fast Autofill)</span></button>" +
+      '</div>';
 
     const dateEl = el.querySelector("#bm-date");
     dateEl.value = new Date().toISOString().slice(0, 10);
@@ -101,12 +103,104 @@ const BillMaker = {
         return;
       }
       if (e.target.closest("#bm-add-row")) {
-        this.items.push({ particulars: "", qty: 1, rate: "", amount: "" });
+        this.items.push({ particulars: "", qty: 1, rate: "", amount: "", stockInfo: "" });
         this.paintRows(main);
         const rows = el.querySelectorAll("#bm-rows input[data-f=particulars]");
         if (rows.length) rows[rows.length - 1].focus();
       }
+      if (e.target.closest("#bm-pick-stock")) {
+        this.openStockPickerModal(main);
+      }
     });
+
+    /* live autocomplete for inventory particulars */
+    const showSuggestions = debounce(async (inp) => {
+      const q = inp.value.trim();
+      const td = inp.closest("td");
+      const sugPop = td.querySelector(".inv-sug-pop");
+      if (!sugPop) return;
+      if (q.length < 2) {
+        sugPop.classList.add("hidden");
+        return;
+      }
+
+      try {
+        const key = q.toLowerCase();
+        const cached = this.searchCache[key];
+        let res;
+        if (cached && Date.now() - cached.time < 30000) {
+          res = cached.data;
+        } else {
+          res = await API.get("/api/inventory/search?q=" + encodeURIComponent(q) + "&limit=8");
+          this.searchCache[key] = { data: res, time: Date.now() };
+        }
+        if (inp.value.trim() !== q) return;
+        if (!res.results || !res.results.length) {
+          sugPop.classList.add("hidden");
+          return;
+        }
+
+        sugPop.innerHTML =
+          '<div style="padding:6px 10px;font-size:10.5px;font-weight:750;color:var(--ink-3);text-transform:uppercase;background:var(--bg-inset);border-bottom:1px solid var(--line-2)">' +
+          'Stock Autofill Suggestions' +
+          '</div>' +
+          res.results.map((r) =>
+            '<div class="inv-sug-hit" data-item=\'' + escapeHtml(JSON.stringify(r)) + '\'>' +
+            '<div style="display:flex;align-items:center;justify-content:space-between">' +
+            '<div style="font-weight:700;color:var(--ink);font-size:13.5px">' + escapeHtml(r.name) + '</div>' +
+            '<div class="money" style="font-weight:750;color:var(--accent)">' + fmtMoney(r.sell_price) + '</div>' +
+            '</div>' +
+            '<div style="font-size:12px;color:var(--ink-2);display:flex;justify-content:space-between;margin-top:3px">' +
+            '<span>In Stock: <b style="color:' + (r.stock_qty <= 0 ? 'var(--red)' : 'var(--green-ink)') + '">' + r.stock_qty + ' ' + escapeHtml(r.unit) + '</b></span>' +
+            '<span style="font-size:11px;color:var(--ink-3)">' + escapeHtml(r.category || "General") + '</span>' +
+            '</div></div>'
+          ).join("");
+        sugPop.classList.remove("hidden");
+
+        sugPop.querySelectorAll(".inv-sug-hit").forEach((hit) => {
+          hit.onmousedown = (e) => {
+            e.preventDefault();
+            const item = JSON.parse(hit.getAttribute("data-item"));
+            const tr = inp.closest("tr");
+            const idx = parseInt(tr.getAttribute("data-i"), 10);
+            inp.value = item.name;
+            this.items[idx].particulars = item.name;
+
+            const rateInp = tr.querySelector('input[data-f="rate"]');
+            if (item.sell_price > 0) {
+              rateInp.value = String(item.sell_price);
+              this.items[idx].rate = String(item.sell_price);
+            }
+
+            const qtyInp = tr.querySelector('input[data-f="qty"]');
+            if (!this.items[idx].qty || Number(this.items[idx].qty) <= 0) {
+              this.items[idx].qty = 1;
+              if (qtyInp) qtyInp.value = "1";
+            }
+
+            const qtyVal = toAmountFloat(this.items[idx].qty) || 1;
+            const rateVal = toAmountFloat(this.items[idx].rate) || item.sell_price || 0;
+            const amtInp = tr.querySelector('input[data-f="amount"]');
+            if (qtyVal > 0 && rateVal > 0) {
+              const calcAmt = String(Math.round(qtyVal * rateVal * 100) / 100);
+              this.items[idx].amount = calcAmt;
+              amtInp.value = calcAmt;
+            }
+
+            this.items[idx].stockInfo = 'Available in stock: ' + item.stock_qty + ' ' + item.unit + (item.stock_qty <= 0 ? ' (Out of stock)' : '');
+            sugPop.classList.add("hidden");
+            this.paintTotal(main);
+
+            if (qtyInp) {
+              qtyInp.focus();
+              qtyInp.select();
+            }
+          };
+        });
+      } catch (err) {
+        /* silent */
+      }
+    }, 120);
 
     /* number conversion + live total on any input in the table.
        No re-render here: the tbody stays, focus survives, cells update in place. */
@@ -117,17 +211,21 @@ const BillMaker = {
       const tr = inp.closest("tr");
       const i = parseInt(tr.getAttribute("data-i"), 10);
       const f = inp.getAttribute("data-f");
-      let v = devToAscii(inp.value);
-      if (f !== "particulars") {
-        v = v.replace(/रू|rs\.?|npr/gi, "").replace(/[^\d.]/g, "");
-        /* one dot max: "1.2.3" is a typo, never a number */
-        const first = v.indexOf(".");
-        if (first !== -1) v = v.slice(0, first + 1) + v.slice(first + 1).replace(/\./g, "");
+
+      if (f === "particulars") {
+        this.items[i].particulars = inp.value;
+        showSuggestions(inp);
+        return;
       }
+
+      let v = devToAscii(inp.value);
+      v = v.replace(/रू|rs\.?|npr/gi, "").replace(/[^\d.]/g, "");
+      const first = v.indexOf(".");
+      if (first !== -1) v = v.slice(0, first + 1) + v.slice(first + 1).replace(/\./g, "");
       if (v !== inp.value) inp.value = v;
       this.items[i][f] = inp.value;
+
       if (f === "qty" || f === "rate") {
-        /* qty or rate changed: recompute amount = qty x rate, in place */
         const q = toAmountFloat(this.items[i].qty) || 0;
         const r = toAmountFloat(this.items[i].rate) || 0;
         const amtCell = tr.querySelector('input[data-f="amount"]');
@@ -135,12 +233,25 @@ const BillMaker = {
           this.items[i].amount = String(Math.round(q * r * 100) / 100);
           amtCell.value = this.items[i].amount;
         } else {
-          /* missing half of the math: show nothing rather than a wrong number */
           this.items[i].amount = "";
           amtCell.value = "";
         }
       }
       this.paintTotal(main);
+    });
+
+    tbody.addEventListener("focusin", (e) => {
+      if (e.target.matches('input[data-f="particulars"]')) {
+        showSuggestions(e.target);
+      }
+    });
+
+    tbody.addEventListener("focusout", (e) => {
+      if (e.target.matches('input[data-f="particulars"]')) {
+        const td = e.target.closest("td");
+        const pop = td.querySelector(".inv-sug-pop");
+        if (pop) setTimeout(() => pop.classList.add("hidden"), 200);
+      }
     });
 
     this.paintTotal(main);
@@ -150,7 +261,11 @@ const BillMaker = {
     const num = (v) => (v === "" || v == null ? "" : String(v));
     return '<tr data-i="' + i + '">' +
       '<td class="bm-sn">' + (i + 1) + "</td>" +
-      '<td><input class="input bm-in" data-f="particulars" placeholder="e.g. sunflower oil 1L" value="' + escapeHtml(it.particulars) + '"></td>' +
+      '<td style="position:relative">' +
+      '<input class="input bm-in" data-f="particulars" placeholder="e.g. sunflower oil 1L" value="' + escapeHtml(it.particulars) + '" autocomplete="off">' +
+      '<div class="inv-sug-pop hidden"></div>' +
+      (it.stockInfo ? '<div class="bm-stock-info">' + escapeHtml(it.stockInfo) + '</div>' : '') +
+      '</td>' +
       '<td><input class="input bm-in num" data-f="qty" inputmode="decimal" placeholder="Qty" value="' + escapeHtml(num(it.qty)) + '"></td>' +
       '<td><input class="input bm-in num" data-f="rate" inputmode="decimal" placeholder="Rate" value="' + escapeHtml(num(it.rate)) + '"></td>' +
       '<td><input class="input bm-in num money" data-f="amount" inputmode="decimal" placeholder="Amount" value="' + escapeHtml(num(it.amount)) + '"></td>' +
@@ -194,7 +309,7 @@ const BillMaker = {
     }
   },
 
-  /* ---------- side: photo + save ---------- */
+  /* ---------- side: summary + AI card + save ---------- */
   renderSide(main) {
     const el = main.querySelector("#bm-side");
     el.innerHTML =
@@ -230,29 +345,15 @@ const BillMaker = {
   renderPhotoBox(main) {
     const box = main.querySelector("#bm-photo-box");
     box.innerHTML =
-      '<div class="under-construction-banner">' + ico("gear") +
-      ' <span>Photo feature — Under Construction</span></div>' +
-      '<div class="hint" style="margin-top:6px;text-align:center">All bill calculations and WhatsApp PDF sharing work 100% without photos.</div>';
-  },
-
-  async pickPhoto(main, wantCamera) {
-    const input = document.createElement("input");
-    input.type = "file";
-    input.accept = "image/jpeg,image/png,image/webp";
-    if (wantCamera !== false && window.matchMedia("(max-width: 900px)").matches) {
-      input.capture = "environment";
-    }
-    input.onchange = () => {
-      const f = input.files && input.files[0];
-      if (!f) return;
-      if (f.size > 40 * 1024 * 1024) { toast("Photo too large (max 40MB)", "err"); return; }
-      this.photoFile = f;
-      if (this.photoUrl) URL.revokeObjectURL(this.photoUrl);
-      f.arrayBuffer().then((buf) => { this.photoBytes = new Uint8Array(buf); });
-      this.photoUrl = URL.createObjectURL(f);
-      this.renderPhotoBox(main);
-    };
-    input.click();
+      '<div class="ai-scanner-card">' +
+      '<div class="ai-scanner-head">' +
+      '<div class="ai-ico-wrap">' + ico("sparkles") + '</div>' +
+      '<div style="flex:1">' +
+      '<div class="ai-scanner-title">AI Bill Scanner <span class="badge badge-pro">' + ico("lock") + ' v2.0 Locked</span></div>' +
+      '<div class="ai-scanner-sub">Instantly scan receipts & handwritten bills into itemized rows with Deep AI Vision.</div>' +
+      '</div></div>' +
+      '<div class="ai-scanner-badge">' + ico("clock") + ' Unlocks in Khata Sathi v2.0</div>' +
+      '</div>';
   },
 
   save(main) {
@@ -292,9 +393,10 @@ const BillMaker = {
       items,
     };
 
-    const finish = (photoB64) => {
-      if (photoB64) payload.photo_b64 = photoB64;
+    const finish = () => {
       API.post("/api/bills/itemized/add", payload).then((res) => {
+        this.stockCache = null;
+        this.searchCache = {};
         let msg = "Bill " + res.bill_no + " saved — " + fmtMoney(res.amount);
         if ((alreadyPaid || paidNow > 0) && res.galla_in) msg += " · cash added to today's galla";
         if (paidNow > 0) msg += " · " + fmtMoney(paidNow) + " paid, " + fmtMoney(res.remaining) + " left";
@@ -302,21 +404,14 @@ const BillMaker = {
         this.shareDialog(res, name);
       }).catch((e) => {
         if (e.message && e.message.includes("Open today's galla")) {
-          promptOpenGalla(() => finish(photoB64));
+          promptOpenGalla(() => finish());
         } else {
           toast(e.message, "err");
         }
       });
     };
 
-    if (this.photoFile) {
-      const fr = new FileReader();
-      fr.onload = () => finish(fr.result.split(",")[1]);
-      fr.onerror = () => finish(null);
-      fr.readAsDataURL(this.photoFile);
-    } else {
-      finish(null);
-    }
+    finish();
   },
 
   /* ---------- share: WhatsApp mobile + desktop ---------- */
@@ -349,5 +444,109 @@ const BillMaker = {
         whatsappShare(pdfUrl, text, "bill-" + res.bill_no + ".pdf");
       }
     });
+  },
+
+  /* ---------- Pick from Stock Modal ---------- */
+  async openStockPickerModal(main) {
+    try {
+      let items = [];
+      const cacheFresh = this.stockCache && Date.now() - this.stockCacheAt < 30000;
+      const body = document.createElement("div");
+      body.innerHTML =
+        '<div class="field" style="margin-bottom:12px">' +
+        '<div class="input-with-ico">' + ico("search") +
+        '<input class="input" id="sp-search" placeholder="Search product name, category, or SKU…" autocomplete="off"></div></div>' +
+        '<div id="sp-list" style="max-height:360px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;padding:2px"></div>';
+
+      const renderList = (filterText = "") => {
+        const listEl = body.querySelector("#sp-list");
+        const filtered = items.filter((it) =>
+          !filterText ||
+          it.name.toLowerCase().includes(filterText.toLowerCase()) ||
+          (it.category && it.category.toLowerCase().includes(filterText.toLowerCase())) ||
+          (it.sku && it.sku.toLowerCase().includes(filterText.toLowerCase()))
+        );
+
+        if (!filtered.length) {
+          listEl.innerHTML = '<div style="padding:28px;text-align:center;color:var(--ink-2);font-size:13.5px">No matching stock items</div>';
+          return;
+        }
+
+        listEl.innerHTML = filtered.map((it) => {
+          const catLower = (it.category || "").toLowerCase();
+          let avatarClass = "groceries";
+          if (catLower.includes("grain") || catLower.includes("rice")) avatarClass = "grains";
+          else if (catLower.includes("bev") || catLower.includes("tea")) avatarClass = "beverages";
+          else if (catLower.includes("snack") || catLower.includes("noodle")) avatarClass = "snacks";
+
+          return '<div class="sp-item panel" data-id="' + it.id + '" style="padding:10px 14px;display:flex;align-items:center;justify-content:space-between;cursor:pointer;border:1.5px solid var(--line-2);border-radius:10px;transition:all 0.15s ease">' +
+            '<div style="display:flex;align-items:center;gap:12px">' +
+            '<div class="prod-avatar ' + avatarClass + '" style="width:34px;height:34px;font-size:13px">' + escapeHtml(it.name.charAt(0).toUpperCase()) + '</div>' +
+            '<div><div style="font-weight:700;font-size:14.5px;color:var(--ink)">' + escapeHtml(it.name) + '</div>' +
+            '<div style="font-size:12px;color:var(--ink-2);margin-top:2px">Stock: <b style="color:' + (it.stock_qty <= 0 ? 'var(--red)' : 'var(--green-ink)') + '">' + it.stock_qty + ' ' + escapeHtml(it.unit) + '</b> · ' + escapeHtml(it.category || "General") + '</div>' +
+            '</div></div>' +
+            '<div style="display:flex;align-items:center;gap:12px">' +
+            '<div class="money" style="font-weight:750;font-size:15px">' + fmtMoney(it.sell_price) + '</div>' +
+            '<button class="btn sm primary" data-act="pick-add" style="padding:5px 12px;font-size:12.5px">' + ico("plus") + ' Add</button>' +
+            '</div></div>';
+        }).join("");
+
+        listEl.querySelectorAll(".sp-item").forEach((el) => {
+          el.onmouseenter = () => { el.style.borderColor = "var(--accent)"; el.style.background = "var(--bg-inset)"; };
+          el.onmouseleave = () => { el.style.borderColor = "var(--line-2)"; el.style.background = ""; };
+          el.onclick = () => {
+            const id = el.getAttribute("data-id");
+            const it = items.find((x) => x.id === id);
+            if (!it) return;
+            this.addStockItemToBill(it, main);
+            toast("Added " + it.name + " to bill", "ok", 1200);
+          };
+        });
+      };
+
+      const searchInp = body.querySelector("#sp-search");
+      searchInp.addEventListener("input", debounce(() => renderList(searchInp.value.trim()), 100));
+
+      modal({
+        title: "Pick Products from Stock",
+        body,
+        buttons: [{ label: "Done", cls: "primary" }]
+      });
+
+      if (cacheFresh) {
+        items = this.stockCache;
+        renderList();
+      } else {
+        body.querySelector("#sp-list").innerHTML = '<div style="padding:24px;text-align:center;color:var(--ink-2)">Loading stock...</div>';
+        const res = await API.get("/api/inventory");
+        items = res.items || [];
+        this.stockCache = items;
+        this.stockCacheAt = Date.now();
+        renderList(searchInp.value.trim());
+      }
+
+      setTimeout(() => searchInp.focus(), 60);
+    } catch (e) {
+      toast("Could not load stock: " + e.message, "err");
+    }
+  },
+
+  addStockItemToBill(it, main) {
+    let targetIdx = this.items.length - 1;
+    if (targetIdx < 0 || this.items[targetIdx].particulars || this.items[targetIdx].amount) {
+      this.items.push({ particulars: "", qty: 1, rate: "", amount: "", stockInfo: "" });
+      targetIdx = this.items.length - 1;
+    }
+
+    const row = this.items[targetIdx];
+    row.particulars = it.name;
+    row.rate = it.sell_price > 0 ? String(it.sell_price) : "";
+    row.qty = row.qty || 1;
+    if (row.rate) {
+      row.amount = String(Math.round((toAmountFloat(row.qty) || 1) * (toAmountFloat(row.rate) || 0) * 100) / 100);
+    }
+    row.stockInfo = 'Available in stock: ' + it.stock_qty + ' ' + it.unit + (it.stock_qty <= 0 ? ' (Out of stock)' : '');
+
+    this.paintRows(main);
   },
 };

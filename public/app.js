@@ -2,7 +2,7 @@
 "use strict";
 
 /* global API, Live, ico, toast, modal, escapeHtml, debounce, fmtMoney, fmtDate, avatarEl,
-   Dashboard, People, Ledger, AddBill, Payment, Activity, Settings, BillMaker, Galla, LedgerView */
+   Dashboard, People, Ledger, AddBill, Payment, Activity, Settings, BillMaker, Galla, LedgerView, Inventory */
 
 const GOOGLE_ICON_SVG = '<svg viewBox="0 0 24 24"><path fill="#4285F4" d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17z"/><path fill="#34A853" d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.1-6.72-4.93H1.25v3.15C3.26 21.36 7.34 24 12 24z"/><path fill="#FBBC05" d="M5.28 14.27c-.25-.72-.38-1.49-.38-2.27s.13-1.55.38-2.27V6.58H1.25C.45 8.18 0 9.98 0 12s.45 3.82 1.25 5.42l4.03-3.15z"/><path fill="#EA4335" d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.34 0 3.26 2.64 1.25 6.58l4.03 3.15c.95-2.83 3.6-4.98 6.72-4.98z"/></svg>';
 
@@ -16,7 +16,11 @@ const App = {
     this.registerViews();
     this.paintIcons();
     this.applyTheme(localStorage.getItem("bs_theme") || "light");
-    window.addEventListener("bs-auth-expired", () => this.showAuth("login"));
+    window.addEventListener("bs-auth-expired", () => {
+      API.token = "";
+      localStorage.removeItem("bs_token");
+      this.showAuth("login");
+    });
 
     // Check for Google OAuth callback in URL hash or query params
     this.handleOAuthCallback();
@@ -24,12 +28,21 @@ const App = {
     try {
       this.state = await API.get("/api/state");
     } catch (e) {
-      document.body.innerHTML = '<div class="auth-wrap"><div class="panel panel-pad">Cannot reach the Khata Sathi cloud server.<br>Please check your internet connection.</div></div>';
-      return;
+      console.warn("Could not fetch auth state:", e);
+      this.state = { authenticated: false };
     }
 
-    if (!API.token && !this.state.authenticated) {
-      this.showAuth("login");
+    if (!this.state || !this.state.authenticated) {
+      API.token = "";
+      localStorage.removeItem("bs_token");
+      const hash = (window.location.hash || "").toLowerCase();
+      if (hash === "#login") {
+        this.showAuth("login");
+      } else if (hash === "#signup") {
+        this.showAuth("signup");
+      } else {
+        this.showLanding();
+      }
     } else {
       this.showApp();
     }
@@ -55,7 +68,7 @@ const App = {
   },
 
   registerViews() {
-    [Dashboard, People, Ledger, AddBill, BillMaker, Payment, Activity, Settings, Galla, LedgerView].forEach((v) => {
+    [Dashboard, People, Ledger, AddBill, BillMaker, Payment, Activity, Settings, Galla, LedgerView, Inventory].forEach((v) => {
       this.views[v.id] = v;
     });
   },
@@ -93,9 +106,10 @@ const App = {
       { v: "dash", label: "Dashboard", icon: "dash", mobile: true },
       { v: "people", label: "People", icon: "people", mobile: true },
       { v: "ledgerhub", label: "Ledger", icon: "bill", mobile: true },
-      { v: "add", label: "Add bill", icon: "cam", mobile: true },
       { v: "billmaker", label: "Make bill", icon: "doc", mobile: true },
+      { v: "inventory", label: "Inventory", icon: "box", mobile: true },
       { v: "galla", label: "Galla", icon: "wallet", mobile: true },
+      { v: "add", label: "Add bill", icon: "cam", mobile: false },
       { v: "activity", label: "Activity", icon: "clock", mobile: false },
       { v: "settings", label: "Settings", icon: "gear", mobile: false },
     ];
@@ -126,7 +140,7 @@ const App = {
       Live.disconnect();
       API.token = "";
       localStorage.removeItem("bs_token");
-      this.showAuth("login");
+      this.showLanding();
     };
     document.getElementById("btn-back").onclick = () => {
       if (history.length > 1) history.back();
@@ -202,26 +216,47 @@ const App = {
   connectLive() {
     Live.disconnect();
     Live.connect();
-    ["people", "dash", "ledger", "galla", "*"].forEach((k) => Live.on(k, () => {
-      if (this.current === "dash" && (k === "dash" || k === "*")) this.views.dash.load(document.getElementById("main"));
+    ["people", "dash", "ledger", "galla", "inventory", "*"].forEach((k) => Live.on(k, () => {
+      if (this.current === "dash" && (k === "dash" || k === "inventory" || k === "*")) this.views.dash.load(document.getElementById("main"));
       if (this.current === "people" && (k === "people" || k === "*")) this.views.people.load(document.getElementById("main"));
       if (this.current === "ledgerhub" && (k === "ledger" || k === "people" || k === "*")) {
         const v = this.views.ledgerhub;
         v.render(document.getElementById("main"), { person: v.personId });
       }
+      if (this.current === "inventory" && (k === "inventory" || k === "*")) this.views.inventory.render(document.getElementById("main"));
       if (this.current === "activity" && (k === "*")) this.views.activity.load(document.getElementById("main"));
       if (this.current === "galla" && (k === "galla" || k === "*")) this.views.galla.load(document.getElementById("main"));
     }));
   },
 
-  /* ---------- auth screens ---------- */
+  /* ---------- landing & auth screens ---------- */
+  showLanding() {
+    document.getElementById("app").classList.add("hidden");
+    document.getElementById("auth").classList.add("hidden");
+    const landingEl = document.getElementById("landing");
+    if (landingEl) {
+      landingEl.classList.remove("hidden");
+      if (!this._landingRendered && window.Landing) {
+        Landing.render(landingEl);
+        this._landingRendered = true;
+      }
+    }
+    document.title = "Khata Sathi · Smart Digital Khata & Billing for Nepali Shops";
+  },
+
   showAuth(tab = "login") {
     document.getElementById("app").classList.add("hidden");
+    const landingEl = document.getElementById("landing");
+    if (landingEl) landingEl.classList.add("hidden");
     const wrap = document.getElementById("auth");
     wrap.classList.remove("hidden");
     const card = document.getElementById("auth-card");
 
     card.innerHTML =
+      '<div style="display:flex;justify-content:space-between;align-items:center;width:100%;margin-bottom:12px">' +
+      '<button class="btn ghost sm" id="btn-back-landing" style="font-size:12px;padding:4px 10px;display:inline-flex;align-items:center;gap:4px">← Back to Home</button>' +
+      '<span style="font-size:11px;color:var(--ink-3);font-weight:600">🇳🇵 Nepal Cloud</span>' +
+      '</div>' +
       '<div class="auth-logo">K</div>' +
       '<div class="auth-kicker">Khata Sathi Cloud</div>' +
       '<div class="auth-title">Your Bills & Khata</div>' +
@@ -234,6 +269,7 @@ const App = {
       '</div>' +
       '<div id="auth-form-body"></div>';
 
+    card.querySelector("#btn-back-landing").onclick = () => this.showLanding();
     card.querySelector("#btn-google-auth").onclick = () => this.startGoogleOAuth();
     card.querySelector("#tab-login").onclick = () => this.renderAuthTab(card, "login");
     card.querySelector("#tab-signup").onclick = () => this.renderAuthTab(card, "signup");
@@ -259,16 +295,27 @@ const App = {
     const form = card.querySelector("#auth-form-body");
     if (tab === "login") {
       form.innerHTML =
-        '<div class="field"><label>Email address</label><input class="input" id="auth-email" type="email" placeholder="you@example.com" autocomplete="email"></div>' +
+        '<div class="field"><label>Username or email</label><input class="input" id="auth-email" type="text" placeholder="admin or you@example.com" autocomplete="username"></div>' +
         '<div class="field" style="margin-top:12px"><label>Password</label><input class="input" id="auth-pass" type="password" placeholder="••••••••" autocomplete="current-password"></div>' +
         '<button class="btn primary lg block" id="auth-submit" style="margin-top:18px">Sign In</button>' +
-        '<div class="auth-links">' +
+        '<div class="auth-demo-badge" id="btn-quick-admin" style="margin-top:12px; text-align:center; padding:9px 12px; background:var(--bg-active, #f0f7ff); border:1px dashed var(--accent, #2563eb); border-radius:8px; cursor:pointer; font-size:12.5px; color:var(--accent, #2563eb); font-weight:600; transition:all 0.15s ease;">' +
+        'Quick Login: <b>admin</b> / <b>admin</b>' +
+        '</div>' +
+        '<div class="auth-links" style="margin-top:14px">' +
         '<a class="auth-link" id="auth-forgot">Forgot password?</a>' +
         '<a class="auth-link" id="auth-switch-su">New shop? Sign up</a>' +
         '</div>';
 
       form.querySelector("#auth-submit").onclick = () => this.doLogin(card);
       form.querySelector("#auth-pass").addEventListener("keydown", (e) => { if (e.key === "Enter") this.doLogin(card); });
+      const quickBtn = form.querySelector("#btn-quick-admin");
+      if (quickBtn) {
+        quickBtn.onclick = () => {
+          form.querySelector("#auth-email").value = "admin";
+          form.querySelector("#auth-pass").value = "admin";
+          this.doLogin(card);
+        };
+      }
       form.querySelector("#auth-forgot").onclick = () => this.showForgotPassword();
       form.querySelector("#auth-switch-su").onclick = () => this.renderAuthTab(card, "signup");
       setTimeout(() => form.querySelector("#auth-email").focus(), 60);
@@ -293,7 +340,7 @@ const App = {
   async doLogin(card) {
     const email = card.querySelector("#auth-email").value.trim();
     const password = card.querySelector("#auth-pass").value.trim();
-    if (!email) { toast("Enter your email address", "err"); return; }
+    if (!email) { toast("Enter your username or email", "err"); return; }
     if (!password) { toast("Enter your password", "err"); return; }
 
     try {
@@ -366,6 +413,8 @@ const App = {
 
   /* ---------- app ---------- */
   async showApp() {
+    const landingEl = document.getElementById("landing");
+    if (landingEl) landingEl.classList.add("hidden");
     document.getElementById("auth").classList.add("hidden");
     const appEl = document.getElementById("app");
     appEl.classList.remove("hidden");
@@ -376,7 +425,7 @@ const App = {
     this.paintChrome();
     this.connectLive();
     const hash = (location.hash || "").replace("#", "");
-    const start = ["dash", "people", "ledgerhub", "add", "billmaker", "galla", "activity", "settings"].includes(hash) ? hash : "dash";
+    const start = ["dash", "people", "ledgerhub", "add", "billmaker", "inventory", "galla", "activity", "settings"].includes(hash) ? hash : "dash";
     this.go(start);
   },
 
@@ -439,10 +488,22 @@ const App = {
   },
 };
 
+window.App = App;
+
 window.addEventListener("hashchange", () => {
-  const hash = (location.hash || "").replace("#", "");
-  if (App.current && ["dash", "people", "ledgerhub", "add", "billmaker", "galla", "activity", "settings"].includes(hash) && hash !== App.current) {
-    App.go(hash);
+  const hash = (location.hash || "").replace("#", "").toLowerCase();
+  if (App.state && App.state.authenticated) {
+    if (["dash", "people", "ledgerhub", "add", "billmaker", "inventory", "galla", "activity", "settings"].includes(hash) && hash !== App.current) {
+      App.go(hash);
+    }
+  } else {
+    if (hash === "login") {
+      App.showAuth("login");
+    } else if (hash === "signup") {
+      App.showAuth("signup");
+    } else if (hash === "landing" || hash === "" || hash.startsWith("lp-")) {
+      App.showLanding();
+    }
   }
 });
 
