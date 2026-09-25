@@ -1,0 +1,2 @@
+/api/*  https://khatasathi.vercel.app/api/:splat  200
+/photo/*  https://khatasathi.vercel.app/photo/:splat  200
